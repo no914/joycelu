@@ -2,11 +2,12 @@
 
 ## Summary
 
-Three major issues were identified and fixed in the PPT to video converter:
+Four major issues were identified and fixed in the PPT to video converter:
 
 1. ✅ **Duplicate Background Images**
 2. ✅ **Inaccurate Laser Pointer Timing**  
 3. ✅ **Laser Timing Duration Mismatch**
+4. ✅ **Laser Point Overlap (Segment Mismatch)**
 
 ---
 
@@ -100,6 +101,40 @@ adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_dura
 
 ---
 
+## Fix #4: Laser Point Overlap (Segment Mismatch)
+
+### Problem
+Even after duration adjustment, laser points were overlapping because of a fundamental mismatch between text segmentation for audio and laser timing calculation.
+
+**Issue:**
+- Text segments: Split for audio generation per logical phrases
+- Laser timing: Calculated based on entire concatenated text  
+- Result: Multiple lasers appearing simultaneously in one segment
+
+### Root Cause
+```
+Audio segments:
+- 段落1: "请看这里[cursor: 50, 50]的重点内容[cursor: off]" (2.3s - 3.5s)
+- 段落2: "再看这里[cursor: 50, 20]的另一个重点[cursor: off]" (3.5s - 4.5s)
+
+Laser timing (global calculation):
+- Laser 1: 2.4s - 3.6s (spans segments 1-2) ← Problem!
+- Laser 2: 4.4s - 5.8s (spans segments 2-3) ← Problem!
+```
+
+### Solution
+Replaced global laser timing with **segment-based laser processing**.
+
+**New Approach:**
+1. Process each segment individually
+2. Calculate laser timing within each segment's timeframe  
+3. Ensure lasers don't overlap between segments
+4. Fallback to position-based timing when word timing fails
+
+**Key Method:** `parse_laser_actions_from_segments()`
+
+---
+
 ## Language Support
 
 ### Chinese Text Processing
@@ -134,6 +169,11 @@ adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_dura
 - **Lines ~540-560**: Enhanced debugging for laser point activity checking
 - **Lines ~570-590**: Added laser drawing confirmation output
 
+#### Segment Overlap Fix:
+- **Line ~418**: Disabled global laser parsing approach
+- **Lines ~472-480**: Replaced with segment-based laser parsing
+- **Lines ~1090-1180**: Added `parse_laser_actions_from_segments()` method
+
 ---
 
 ## Expected Results
@@ -142,6 +182,7 @@ adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_dura
 ✅ **Single background per slide** (no more duplicates)  
 ✅ **Precise laser timing** synchronized with spoken words  
 ✅ **Duration-adjusted timing** matching actual audio length
+✅ **No laser overlap** - sequential appearance per segment
 ✅ **Language-aware processing** for Chinese and English  
 ✅ **Speed compensation** for different speech rates  
 ✅ **All existing features intact** (audio, subtitles, animations)
@@ -166,18 +207,26 @@ adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_dura
 
 You should now see comprehensive timing information like:
 ```
-🟢 激光点开始时间: 11.10秒 (在文本 '这是第一页内容
-请看这里' 之后)
-🔴 激光点结束时间: 16.10秒 (在文本 '这是第一页内容
-请看这里的重点内容' 之后)
+� 分析段落1: '请看这里[cursor: 50, 50]的重点内容[cursor: off]' (时间: 2.3s - 3.5s)
+�🟢 激光点开始: 2.8s 坐标(640, 360)
+🔴 激光点结束: 2.8s - 3.4s
 
-🔧 激光时间已调整到实际音频时长: 5.7秒
-🔧 调整后的激光点: [{'x': 640, 'y': 360, 'start': 2.4, 'end': 3.5}]
+🔍 分析段落2: '再看这里[cursor: 50, 20]的另一个重点[cursor: off]' (时间: 3.5s - 4.5s)
+🟢 激光点开始: 3.8s 坐标(640, 144)  
+� 激光点结束: 3.8s - 4.4s
 
-🔍 段落1: 时间范围 2.3s - 3.5s
-✅ 激光点活跃: 2.4s - 3.5s 在段落 2.3s - 3.5s
+🔧 基于段落解析的激光点: [
+  {'x': 640, 'y': 360, 'start': 2.8, 'end': 3.4},
+  {'x': 640, 'y': 144, 'start': 3.8, 'end': 4.4}
+]
+
+段落1: 时间范围 2.3s - 3.5s
+✅ 激光点活跃: 2.8s - 3.4s 在段落 2.3s - 3.5s
 🎯 正在绘制激光点: 坐标(640, 360), 半径=28
-✅ 激光点绘制完成
+
+段落2: 时间范围 3.5s - 4.5s  
+✅ 激光点活跃: 3.8s - 4.4s 在段落 3.5s - 4.5s
+🎯 正在绘制激光点: 坐标(640, 144), 半径=28
 ```
 
-**All three issues (duplicate background, laser timing accuracy, and duration mismatch) are now completely resolved!**
+**All four issues (duplicate background, laser timing accuracy, duration mismatch, and overlap) are now completely resolved!**

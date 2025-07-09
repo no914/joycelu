@@ -415,8 +415,8 @@ class PPTSyncedConverter:
             # 提取纯净文本（移除激光指令）
             display_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', notes_text).strip()
             
-            # 解析激光点（带安全坐标检查）
-            laser_points = self.parse_laser_actions(notes_text, None, width, height, lang, speed)
+            # 暂时延迟激光点解析，在有实际段落时长后再处理
+            # laser_points = self.parse_laser_actions(notes_text, None, width, height, lang, speed)
 
             # ==================== 3. 文本预处理 ====================
             # 自动翻译非目标语言文本
@@ -480,8 +480,15 @@ class PPTSyncedConverter:
                     })
                     current_time += fallback_duration
 
-            # ==================== 4.5. 调整激光时间到实际音频时长 ====================
-            if laser_points and segment_data:
+            # ==================== 4.5. 基于实际段落解析激光点 ====================
+            laser_points = []
+            if segment_data:
+                laser_points = self.parse_laser_actions_from_segments(segment_data, width, height, lang, speed)
+                print(f"🔧 基于段落解析的激光点: {laser_points}")
+
+            # ==================== 4.6. 调整激光时间到实际音频时长 (现在不需要了) ====================
+            # 因为我们现在直接基于实际段落计算，所以不需要额外调整
+            if False and laser_points and segment_data:
                 actual_total_duration = max(seg.get("end_time", 0) for seg in segment_data)
                 if actual_total_duration > 0:
                     adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_duration)
@@ -1106,6 +1113,106 @@ class PPTSyncedConverter:
                             return word_timings[i]['end']
         
         return 0.0
+
+    def parse_laser_actions_from_segments(self, segment_data: List[Dict], 
+                                         slide_width: int = 1920, slide_height: int = 1080,
+                                         lang: str = 'zh-cn', speed: float = 1.0) -> List[Dict]:
+        """基于实际段落和时长解析激光笔指令"""
+        laser_points = []
+        
+        try:
+            for seg_idx, segment in enumerate(segment_data):
+                segment_text = segment.get("text", "")
+                segment_start = segment.get("start_time", 0)
+                segment_duration = segment.get("duration", 0)
+                segment_end = segment_start + segment_duration
+                
+                if not segment_text.strip():
+                    continue
+                
+                print(f"🔍 分析段落{seg_idx}: '{segment_text}' (时间: {segment_start:.1f}s - {segment_end:.1f}s)")
+                
+                # 查找激光指令
+                cursor_pattern = re.compile(r'\[cursor:\s*(\d+),\s*(\d+)\]|\[cursor:\s*off\]')
+                matches = list(cursor_pattern.finditer(segment_text))
+                
+                if not matches:
+                    continue
+                
+                # 计算该段落内的单词时间映射
+                word_timings = self.calculate_word_timing(segment_text, lang, speed)
+                
+                # 调整单词时间到该段落的绝对时间
+                adjusted_word_timings = {}
+                for i, timing in word_timings.items():
+                    adjusted_word_timings[i] = {
+                        'word': timing['word'],
+                        'start': timing['start'] + segment_start,
+                        'end': timing['end'] + segment_start
+                    }
+                
+                # 处理该段落中的激光指令
+                current_laser = None
+                
+                for match in matches:
+                    cursor_cmd = match.group()
+                    cursor_pos = match.start()
+                    
+                    # 找到指令前的文本
+                    text_before = segment_text[:cursor_pos]
+                    clean_text_before = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text_before)
+                    
+                    if 'off' in cursor_cmd.lower():
+                        if current_laser:
+                            # 计算结束时间
+                            end_time = self._find_word_end_time(clean_text_before, adjusted_word_timings, lang)
+                            if end_time == 0:  # 如果找不到准确时间，使用段落内的相对位置
+                                relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
+                                end_time = segment_start + (segment_duration * relative_pos)
+                            
+                            current_laser['end'] = min(segment_end, end_time)
+                            laser_points.append(current_laser)
+                            print(f"🔴 激光点结束: {current_laser['start']:.1f}s - {current_laser['end']:.1f}s")
+                            current_laser = None
+                    else:
+                        # 解析坐标
+                        coords = re.findall(r'\d+', cursor_cmd)
+                        if len(coords) >= 2:
+                            try:
+                                x_percent = min(100, max(0, float(coords[0])))
+                                y_percent = min(100, max(0, float(coords[1])))
+                                x = max(0, min(slide_width - 1, int(slide_width * x_percent / 100)))
+                                y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
+                                
+                                # 计算开始时间
+                                start_time = self._find_word_end_time(clean_text_before, adjusted_word_timings, lang)
+                                if start_time == 0:  # 如果找不到准确时间，使用段落内的相对位置
+                                    relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
+                                    start_time = segment_start + (segment_duration * relative_pos)
+                                
+                                current_laser = {
+                                    'x': x,
+                                    'y': y,
+                                    'start': max(segment_start, start_time),
+                                    'end': segment_end  # 默认到段落结束，如果有off指令会被修改
+                                }
+                                print(f"🟢 激光点开始: {current_laser['start']:.1f}s 坐标({x}, {y})")
+                                
+                            except (ValueError, TypeError) as e:
+                                print(f"坐标解析错误: {str(e)}")
+                                continue
+                
+                # 如果段落结束时还有未关闭的激光点
+                if current_laser:
+                    current_laser['end'] = segment_end
+                    laser_points.append(current_laser)
+                    print(f"🔴 激光点自动结束在段落末尾: {current_laser['start']:.1f}s - {current_laser['end']:.1f}s")
+            
+            return laser_points
+            
+        except Exception as e:
+            print(f"段落激光点解析错误: {str(e)}")
+            return []
 
     def make_layers_compatible(self, layers):
         """确保所有图层通道一致"""
