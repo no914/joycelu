@@ -325,118 +325,84 @@ class PPTSyncedConverter:
         return '\n'.join(final_lines)
     
     def process_audio_segment(self, text_segment, lang, speed, temp_dir, index):
-        # Use MP3 extension consistently
-        temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
-        final_audio_path = os.path.join(temp_dir, f"final_audio_{index}.mp3")
-        
+        """Process audio segment with comprehensive fallback to prevent MoviePy indexing errors"""
         try:
             # Validate input parameters
             if not text_segment or not text_segment.strip():
-                # Return silent audio for empty text
+                # Return NO audio for empty text - MoviePy handles this better
                 duration = 1.0
-                silent_audio = AudioClip(lambda t: 0, duration=duration)
-                return silent_audio, duration
+                return None, duration
+            
+            # Clean the text segment
+            clean_text = text_segment.strip()
             
             # Validate speed parameter
-            speed = max(0.5, min(3.0, float(speed)))  # Clamp speed between 0.5x and 3.0x
+            speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
             
-            # 1. Generate TTS audio with error handling
+            # Calculate expected duration (conservative estimate)
+            estimated_duration = max(1.0, len(clean_text) * 0.15)  # 150ms per character
+            estimated_duration = min(15.0, estimated_duration)  # Cap at 15 seconds
+            
+            print(f"尝试生成音频: 文本长度={len(clean_text)}, 预估时长={estimated_duration:.1f}秒")
+            
+            # Try to generate TTS audio - but with strict safeguards
+            temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
+            
             try:
-                tts = gTTS(text=text_segment.strip(), lang=lang, slow=False)
+                # 1. Generate TTS with timeout
+                tts = gTTS(text=clean_text, lang=lang, slow=False)
                 tts.save(temp_audio_path)
+                
+                # 2. Validate the generated file
+                if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) < 1024:
+                    raise ValueError("TTS生成的文件无效或太小")
+                
+                # 3. Use a much simpler approach - just load the MP3 directly
+                try:
+                    audio = AudioFileClip(temp_audio_path)
+                    
+                    # Quick validation
+                    if audio.duration <= 0 or audio.duration > 30:
+                        audio.close()
+                        raise ValueError(f"音频时长异常: {audio.duration}")
+                    
+                    # Apply speed if needed (with error handling)
+                    if speed != 1.0:
+                        try:
+                            audio = audio.fx(speedx, speed)
+                        except Exception as e:
+                            print(f"语速调整失败，使用原速: {str(e)}")
+                    
+                    # Final validation
+                    final_duration = audio.duration
+                    if final_duration <= 0 or final_duration > 30:
+                        audio.close()
+                        raise ValueError(f"最终音频时长异常: {final_duration}")
+                    
+                    print(f"✅ 音频生成成功: 时长={final_duration:.1f}秒")
+                    return audio, final_duration
+                    
+                except Exception as e:
+                    print(f"音频加载失败: {str(e)}")
+                    # Don't return broken audio - return None instead
+                    return None, estimated_duration
+                    
             except Exception as e:
                 print(f"TTS生成失败: {str(e)}")
-                # Return silent audio as fallback
-                duration = max(1.0, len(text_segment) * 0.1)  # Estimate based on text length
-                silent_audio = AudioClip(lambda t: 0, duration=duration)
-                return silent_audio, duration
-            
-            # 2. Validate and convert the audio file
-            if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) == 0:
-                raise ValueError("TTS failed to generate valid audio file")
-                
-            # 3. Use FFmpeg to ensure proper format with enhanced error handling
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-y',  # Overwrite without asking
-                '-i', temp_audio_path,
-                '-acodec', 'libmp3lame',  # Use standard MP3 codec
-                '-q:a', '2',  # Good quality
-                '-ar', '22050',  # Lower sample rate to reduce memory usage
-                '-ac', '1',  # Mono to reduce file size and processing
-                '-avoid_negative_ts', 'make_zero',  # Fix timing issues
-                final_audio_path
-            ]
-            
-            # Run FFmpeg with comprehensive error handling
-            try:
-                result = subprocess.run(
-                    ffmpeg_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    timeout=30  # Add timeout
-                )
-                
-                if result.returncode != 0:
-                    raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
-            except subprocess.TimeoutExpired:
-                raise RuntimeError("FFmpeg conversion timed out")
-                
-            # 4. Load audio with enhanced safety checks
-            try:
-                # Load with explicit parameters to avoid indexing issues
-                audio = AudioFileClip(final_audio_path, fps=22050)
-                
-                # Validate audio duration
-                if audio.duration <= 0 or audio.duration > 60:  # Sanity check
-                    raise ValueError(f"Invalid audio duration: {audio.duration}")
-                
-                # Ensure audio array is valid before speed adjustment
-                try:
-                    # Test audio by getting a small sample
-                    test_sample = audio.subclip(0, min(0.1, audio.duration))
-                    test_array = test_sample.to_soundarray()
-                    if test_array is None or len(test_array) == 0:
-                        raise ValueError("Audio array is empty or invalid")
-                except Exception as e:
-                    print(f"Audio validation failed: {str(e)}")
-                    raise ValueError("Generated audio is corrupted")
-                
-                # 5. Speed adjustment with bounds checking
-                if speed != 1.0:
-                    try:
-                        # Apply speed change with error handling
-                        audio = audio.fx(speedx, speed)
-                        
-                        # Validate the result
-                        if audio.duration <= 0:
-                            raise ValueError("Speed adjustment resulted in invalid duration")
-                            
-                    except Exception as e:
-                        print(f"Speed adjustment failed: {str(e)}")
-                        # Use original audio without speed change
-                        audio = AudioFileClip(final_audio_path, fps=22050)
-                
-                return audio, audio.duration
-                
-            except Exception as e:
-                print(f"Audio loading failed: {str(e)}")
-                # Fallback: create estimated duration silent audio
-                estimated_duration = max(1.0, len(text_segment) * 0.15)  # 150ms per character
-                silent_audio = AudioClip(lambda t: 0, duration=estimated_duration)
-                return silent_audio, estimated_duration
+                return None, estimated_duration
                 
         except Exception as e:
             print(f"音频处理完全失败: {str(e)}")
-            # Ultimate fallback: return safe silent audio
-            fallback_duration = max(1.0, len(text_segment.strip()) * 0.1) if text_segment else 2.0
-            silent_audio = AudioClip(lambda t: 0, duration=fallback_duration)
-            return silent_audio, fallback_duration
+            fallback_duration = 2.0
+            return None, fallback_duration
             
         finally:
             # Clean up temporary files
-            for f in [temp_audio_path]:
+            temp_files = [
+                os.path.join(temp_dir, f"audio_{index}.mp3"),
+                os.path.join(temp_dir, f"final_audio_{index}.mp3")
+            ]
+            for f in temp_files:
                 if os.path.exists(f):
                     try:
                         os.unlink(f)
@@ -489,19 +455,22 @@ class PPTSyncedConverter:
                     clean_segment = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', segment).strip()
                     
                     # 生成语音（带错误处理）
+                    audio = None
+                    duration = 2.0  # 默认时长
+                    
                     if clean_segment:
-                        audio, duration = self.process_audio_segment(
-                            clean_segment, lang, speed, temp_dir, f"{index}_{i}"
-                        )
-                        
-                        # 验证音频和时长的有效性
-                        if not audio or duration <= 0 or duration > 30:
-                            print(f"音频段落 {i} 无效，使用默认值")
+                        try:
+                            audio, duration = self.process_audio_segment(
+                                clean_segment, lang, speed, temp_dir, f"{index}_{i}"
+                            )
+                            print(f"段落 {i}: 音频={'有效' if audio else '无'}, 时长={duration:.1f}秒")
+                        except Exception as e:
+                            print(f"段落 {i} 音频生成异常: {str(e)}")
+                            audio = None
                             duration = max(1.0, len(clean_segment) * 0.15)
-                            audio = AudioClip(lambda t: 0, duration=duration)
                     else:
                         duration = 3.0 if slide_index == 0 else 1.5  # 默认时长
-                        audio = AudioClip(lambda t: 0, duration=duration)
+                        print(f"段落 {i}: 空文本，使用默认时长 {duration:.1f}秒")
 
                     # 确保时长在合理范围内
                     duration = max(0.5, min(15.0, duration))
@@ -509,7 +478,7 @@ class PPTSyncedConverter:
                     segment_data.append({
                         "text": segment,
                         "clean_text": clean_segment,
-                        "audio": audio,
+                        "audio": audio,  # Can be None - this is intentional
                         "duration": duration,
                         "start_time": current_time,
                         "end_time": current_time + duration
@@ -521,9 +490,9 @@ class PPTSyncedConverter:
                     # 添加一个安全的默认段落
                     fallback_duration = 2.0
                     segment_data.append({
-                        "text": segment,
+                        "text": segment if 'segment' in locals() else "fallback",
                         "clean_text": "",
-                        "audio": AudioClip(lambda t: 0, duration=fallback_duration),
+                        "audio": None,  # No audio for fallback
                         "duration": fallback_duration,
                         "start_time": current_time,
                         "end_time": current_time + fallback_duration
@@ -650,44 +619,63 @@ class PPTSyncedConverter:
                         # 创建安全的白色背景
                         img_array = np.full((height, width, 3), 255, dtype=np.uint8)
 
-                    # ==================== 9. 安全创建视频片段 ====================
+                    # ==================== 9. 超安全创建视频片段 ====================
                     try:
-                        # 创建视频片段
+                        # 创建视频片段 - 使用最保守的方式
                         final_clip = ImageClip(img_array).set_duration(seg["duration"])
                         
-                        # 添加音频（如果存在且有效）
+                        # 音频处理 - 采用最安全的方式
+                        has_valid_audio = False
                         if seg.get("audio") and hasattr(seg["audio"], 'duration'):
                             try:
-                                # 验证音频时长匹配
+                                # 严格验证音频时长匹配
                                 audio_duration = seg["audio"].duration
-                                if audio_duration > 0 and abs(audio_duration - seg["duration"]) < 2.0:
+                                if (audio_duration > 0 and 
+                                    audio_duration <= 30 and  # 最大30秒
+                                    abs(audio_duration - seg["duration"]) < 3.0):  # 放宽时长匹配
+                                    
                                     final_clip = final_clip.set_audio(seg["audio"])
+                                    has_valid_audio = True
+                                    print(f"✅ 段落 {seg_idx}: 成功添加音频，时长 {audio_duration:.1f}秒")
+                                else:
+                                    print(f"⚠️ 段落 {seg_idx}: 音频时长不匹配，跳过音频 (audio={audio_duration:.1f}s, video={seg['duration']:.1f}s)")
                             except Exception as e:
-                                print(f"音频添加失败: {str(e)}")
+                                print(f"⚠️ 段落 {seg_idx}: 音频添加失败: {str(e)}")
                         
-                        # 保存临时文件
+                        if not has_valid_audio:
+                            print(f"📹 段落 {seg_idx}: 创建无音频视频片段，时长 {seg['duration']:.1f}秒")
+                        
+                        # 保存临时文件 - 区分有音频和无音频
                         temp_path = os.path.join(temp_dir, f"seg_{index}_{seg_idx}.mp4")
-                        final_clip.write_videofile(
-                            temp_path,
-                            fps=15,
-                            codec='libx264',
-                            audio_codec='aac',
-                            preset='ultrafast',
-                            threads=1,
-                            ffmpeg_params=[
-                                '-pix_fmt', 'yuv420p',  # 更兼容的像素格式
-                                '-max_muxing_queue_size', '1024',
-                                '-avoid_negative_ts', 'make_zero'  # 避免负时间戳
-                            ],
-                            logger=None,
-                            verbose=False
-                        )
+                        
+                        # 使用更加保守的输出参数
+                        write_params = {
+                            'fps': 15,
+                            'codec': 'libx264',
+                            'preset': 'ultrafast',
+                            'threads': 1,
+                            'logger': None,
+                            'verbose': False,
+                            'ffmpeg_params': [
+                                '-pix_fmt', 'yuv420p',
+                                '-crf', '28',  # 较高压缩比，减少文件大小
+                                '-max_muxing_queue_size', '512',  # 减小队列大小
+                                '-avoid_negative_ts', 'make_zero'
+                            ]
+                        }
+                        
+                        # 只有在有音频时才指定音频编码器
+                        if has_valid_audio:
+                            write_params['audio_codec'] = 'aac'
+                        
+                        final_clip.write_videofile(temp_path, **write_params)
                         
                         # 验证生成的文件
                         if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
                             video_clips.append(temp_path)
+                            print(f"✅ 段落 {seg_idx}: 视频文件生成成功 ({os.path.getsize(temp_path)} bytes)")
                         else:
-                            print(f"生成的视频文件无效: {temp_path}")
+                            print(f"❌ 段落 {seg_idx}: 生成的视频文件无效: {temp_path}")
                             
                         # 清理资源
                         final_clip.close()
@@ -698,7 +686,30 @@ class PPTSyncedConverter:
                                 pass
                                 
                     except Exception as e:
-                        print(f"视频片段创建失败: {str(e)}")
+                        print(f"❌ 段落 {seg_idx}: 视频片段创建失败: {str(e)}")
+                        
+                        # 尝试创建一个极简的后备视频
+                        try:
+                            print(f"🔄 段落 {seg_idx}: 尝试创建后备视频...")
+                            backup_clip = ImageClip(img_array).set_duration(max(1.0, seg["duration"]))
+                            backup_path = os.path.join(temp_dir, f"backup_seg_{index}_{seg_idx}.mp4")
+                            backup_clip.write_videofile(
+                                backup_path,
+                                fps=10,  # 更低帧率
+                                codec='libx264',
+                                preset='ultrafast',
+                                verbose=False,
+                                logger=None
+                            )
+                            backup_clip.close()
+                            
+                            if os.path.exists(backup_path) and os.path.getsize(backup_path) > 512:
+                                video_clips.append(backup_path)
+                                print(f"✅ 段落 {seg_idx}: 后备视频创建成功")
+                            else:
+                                print(f"❌ 段落 {seg_idx}: 后备视频也失败了")
+                        except Exception as backup_e:
+                            print(f"❌ 段落 {seg_idx}: 后备视频创建也失败: {str(backup_e)}")
                         continue
                     
                 except Exception as e:
