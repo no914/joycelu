@@ -480,6 +480,15 @@ class PPTSyncedConverter:
                     })
                     current_time += fallback_duration
 
+            # ==================== 4.5. 调整激光时间到实际音频时长 ====================
+            if laser_points and segment_data:
+                actual_total_duration = max(seg.get("end_time", 0) for seg in segment_data)
+                if actual_total_duration > 0:
+                    adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_duration)
+                    laser_points = adjusted_laser_points
+                    print(f"🔧 激光时间已调整到实际音频时长: {actual_total_duration:.1f}秒")
+                    print(f"🔧 调整后的激光点: {laser_points}")
+
             # ==================== 5. 加载背景图片（只加载一次） ====================
             try:
                 bg_img = Image.open(img_path).convert('RGBA')
@@ -532,10 +541,19 @@ class PPTSyncedConverter:
                             
                             # 找出当前时间段活跃的激光点
                             active_points = []
+                            current_seg_start = seg.get("start_time", 0)
+                            current_seg_end = seg.get("end_time", seg.get("duration", 0))
+                            print(f"🔍 段落{seg_idx}: 时间范围 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
+                            
                             for p in laser_points: 
-                                if (p.get('end', 0) > seg.get("start_time", 0) and
-                                    p.get('start', 0) < seg.get("end_time", seg.get("duration", 0))):
+                                laser_start = p.get('start', 0)
+                                laser_end = p.get('end', 0)
+                                
+                                if (laser_end > current_seg_start and laser_start < current_seg_end):
                                     active_points.append(p)
+                                    print(f"✅ 激光点活跃: {laser_start:.1f}s - {laser_end:.1f}s 在段落 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
+                                else:
+                                    print(f"❌ 激光点不活跃: {laser_start:.1f}s - {laser_end:.1f}s 不在段落 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
                             
                             for p in active_points:
                                 try:
@@ -545,6 +563,8 @@ class PPTSyncedConverter:
                                     # 安全坐标检查
                                     x = max(radius, min(width - radius, int(p['x'])))
                                     y = max(radius, min(height - radius, int(p['y'])))
+                                    
+                                    print(f"🎯 正在绘制激光点: 坐标({x}, {y}), 半径={radius}")
                                         
                                     # 绘制光晕效果
                                     draw.ellipse(
@@ -567,6 +587,7 @@ class PPTSyncedConverter:
                                         ],
                                         fill=Config.LASER_COLOR
                                     )
+                                    print(f"✅ 激光点绘制完成")
                                 except Exception as e:
                                     print(f"激光点绘制失败: {str(e)}")
                                     continue
