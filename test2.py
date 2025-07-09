@@ -416,7 +416,7 @@ class PPTSyncedConverter:
             display_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', notes_text).strip()
             
             # 解析激光点（带安全坐标检查）
-            laser_points = self.parse_laser_actions(notes_text, None, width, height)
+            laser_points = self.parse_laser_actions(notes_text, None, width, height, lang, speed)
 
             # ==================== 3. 文本预处理 ====================
             # 自动翻译非目标语言文本
@@ -918,9 +918,60 @@ class PPTSyncedConverter:
         else:
             return [s.strip() for s in re.split(r'[.!?]', text) if s.strip()]
         
+    def calculate_word_timing(self, text: str, lang: str = 'zh-cn', speed: float = 1.0) -> Dict:
+        """计算每个单词在语音中的时间位置"""
+        clean_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text).strip()
+        
+        if not clean_text:
+            return {}
+        
+        # 基础语音参数
+        speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
+        
+        if lang and lang.startswith('zh'):
+            # 中文：按字符分割
+            chars = list(clean_text)
+            chars_per_second = 3.5 * speed  # 中文每秒约3.5个字符
+            
+            word_timings = {}
+            current_time = 0.0
+            
+            for i, char in enumerate(chars):
+                if char.strip():  # 跳过空格
+                    char_duration = 1.0 / chars_per_second
+                    word_timings[i] = {
+                        'word': char,
+                        'start': current_time,
+                        'end': current_time + char_duration
+                    }
+                    current_time += char_duration
+                else:
+                    current_time += 0.1  # 空格/标点的停顿时间
+        else:
+            # 英文：按单词分割
+            words = clean_text.split()
+            words_per_second = 2.5 * speed  # 英文每秒约2.5个单词
+            
+            word_timings = {}
+            current_time = 0.0
+            
+            for i, word in enumerate(words):
+                word_duration = len(word) / (words_per_second * 3)  # 根据单词长度调整
+                word_duration = max(0.2, min(1.0, word_duration))  # 限制单词时长
+                
+                word_timings[i] = {
+                    'word': word,
+                    'start': current_time,
+                    'end': current_time + word_duration
+                }
+                current_time += word_duration + 0.1  # 单词间停顿
+        
+        return word_timings
+
     def parse_laser_actions(self, note_text: str, duration: float = None, 
-                        slide_width: int = 1920, slide_height: int = 1080) -> List[Dict]:
-        """解析激光笔指令并计算精确时间位置（带完整边界检查）"""
+                        slide_width: int = 1920, slide_height: int = 1080,
+                        lang: str = 'zh-cn', speed: float = 1.0) -> List[Dict]:
+        """解析激光笔指令并计算基于单词的精确时间位置"""
         # 输入验证
         if not note_text or not isinstance(note_text, str):
             return []
@@ -932,116 +983,66 @@ class PPTSyncedConverter:
         print(f"🔍 原始备注文本: '{note_text}'")
         
         try:
-            # 分割文本和激光指令
-            parts = []
-            last_end = 0
+            # 1. 获取单词时间映射
+            word_timings = self.calculate_word_timing(note_text, lang, speed)
+            
+            # 2. 找到激光指令的位置和前后文本
             cursor_pattern = re.compile(r'\[cursor:\s*(\d+),\s*(\d+)\]|\[cursor:\s*off\]')
-            
-            for match in cursor_pattern.finditer(note_text):
-                # 添加前面的文本
-                if last_end < match.start():
-                    text_part = note_text[last_end:match.start()].strip()
-                    if text_part:
-                        parts.append(('text', text_part))
-                # 添加激光指令
-                parts.append(('cursor', match.group()))
-                last_end = match.end()
-            
-            # 添加剩余文本
-            if last_end < len(note_text):
-                remaining_text = note_text[last_end:].strip()
-                if remaining_text:
-                    parts.append(('text', remaining_text))
-            
-            if not any(p[0] == 'text' for p in parts):
-                parts.insert(0, ('text', 'default_content'))
-            
-            # 计算时间权重
-            text_parts = [p[1] for p in parts if p[0] == 'text']
-            text_weight = sum(max(1, len(text)) for text in text_parts)
-            cursor_count = len([p for p in parts if p[0] == 'cursor'])
-            total_weight = max(1, text_weight + cursor_count)
-            
-            # 计算总持续时间
-            if duration and duration > 0:
-                total_duration = min(60.0, max(1.0, duration))
-            else:
-                estimated_duration = 0
-                for text in text_parts:
-                    estimated_duration += max(1.0, len(text) * 0.15)
-                total_duration = min(30.0, max(3.0, estimated_duration))
-
-            print(f"计算的持续总时间: {total_duration}秒")
-            
             laser_points = []
-            current_point = None
-            current_time = 0.0
-            time_step = total_duration / max(1, len(parts))
             
-            for i, (part_type, part_content) in enumerate(parts):
-                if part_type == 'text':
-                    # 文本部分的时间权重
-                    weight = max(1, len(part_content))
-                    segment_duration = max(0.5, (weight / total_weight) * total_duration)
-
-                    if current_time + segment_duration > total_duration:
-                        segment_duration = max(0.1, total_duration - current_time)
+            # 3. 分析每个激光指令的上下文
+            for match in cursor_pattern.finditer(note_text):
+                cursor_cmd = match.group()
+                cursor_pos = match.start()
+                
+                # 找到指令前的文本
+                text_before = note_text[:cursor_pos]
+                # 移除之前的激光指令，只保留纯文本
+                clean_text_before = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text_before)
+                
+                if 'off' in cursor_cmd.lower():
+                    # 激光点结束：找到指令前最后一个单词的结束时间
+                    trigger_time = self._find_word_end_time(clean_text_before, word_timings, lang)
                     
-                    # 更新当前激光点的结束时间
-                    if current_point:
-                        safe_end_time = min(total_duration, current_time + segment_duration)
-                        current_point['end'] = max(current_point['start'] + 0.1, safe_end_time)
-                    
-                    current_time = min(total_duration, current_time + segment_duration)
-                    
-                elif part_type == 'cursor':
-                    if 'off' in part_content.lower():
-                        # 结束当前激光点
-                        if current_point:
-                            current_point['end'] = max(current_point['start'] + 0.1,
-                                                       min(current_time, total_duration))
-                            laser_points.append(current_point)
-                            current_point = None
-                    else:
-                        # 开始新激光点
-                        if current_point:
-                            current_point['end'] = max(current_point['start'] + 0.1, current_time)
-                            laser_points.append(current_point)
-                        
-                        # 解析坐标（带边界检查）
-                        coords = re.findall(r'\d+', part_content)
-                        if len(coords) >= 2:
-                            try:
-                                # 确保百分比在0-100范围内
-                                x_percent = min(100, max(0, float(coords[0])))
-                                y_percent = min(100, max(0, float(coords[1])))
-                                
-                                # 计算实际像素坐标
-                                x = max(0, min(slide_width - 1, int(slide_width * x_percent / 100)))
-                                y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
-
-                                start_time = max(0.0, min(current_time, total_duration - 0.5))
-                                
-                                current_point = {
-                                    'x': x,
-                                    'y': y,
-                                    'start': start_time,
-                                    'end': min(total_duration, start_time + 1.0)  # 默认持续到结束
-                                }
-                            except (ValueError, TypeError) as e:
-                                print(f"坐标解析错误: {str(e)}")
-                                continue
+                    # 更新最后一个激光点的结束时间
+                    if laser_points:
+                        laser_points[-1]['end'] = trigger_time + 0.1  # 稍微延迟一点
+                        print(f"🔴 激光点结束时间: {trigger_time:.2f}秒 (在文本 '{clean_text_before}' 之后)")
+                else:
+                    # 激光点开始：解析坐标并设置开始时间
+                    coords = re.findall(r'\d+', cursor_cmd)
+                    if len(coords) >= 2:
+                        try:
+                            # 坐标转换
+                            x_percent = min(100, max(0, float(coords[0])))
+                            y_percent = min(100, max(0, float(coords[1])))
+                            x = max(0, min(slide_width - 1, int(slide_width * x_percent / 100)))
+                            y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
+                            
+                            # 计算触发时间：指令前最后一个单词的结束时间
+                            trigger_time = self._find_word_end_time(clean_text_before, word_timings, lang)
+                            
+                            laser_point = {
+                                'x': x,
+                                'y': y,
+                                'start': trigger_time,
+                                'end': trigger_time + 2.0  # 默认持续2秒，如果没有off指令
+                            }
+                            laser_points.append(laser_point)
+                            print(f"🟢 激光点开始时间: {trigger_time:.2f}秒 (在文本 '{clean_text_before}' 之后)")
+                            
+                        except (ValueError, TypeError) as e:
+                            print(f"坐标解析错误: {str(e)}")
+                            continue
             
-            # 处理最后一个激光点
-            if current_point:
-                current_point['end'] = max(current_point['start'] + 0.1,
-                                           min(total_duration, current_point['start'] + 2.0))
-                laser_points.append(current_point)
-
+            # 4. 验证和调整时间
             validated_points = []
+            total_duration = max(word_timings[k]['end'] for k in word_timings) if word_timings else 3.0
+            
             for point in laser_points:
                 start = max(0.0, min(total_duration - 0.1, point['start']))
                 end = max(start + 0.1, min(total_duration, point['end']))
+                
                 if end > start and start >= 0:
                     validated_points.append({
                         'x': point['x'],
@@ -1052,9 +1053,38 @@ class PPTSyncedConverter:
             
             print(f"🔧 解析后的激光点: {validated_points}")
             return validated_points
+            
         except Exception as e:
             print(f"激光点解析错误: {str(e)}")
             return []
+
+    def _find_word_end_time(self, text_before: str, word_timings: Dict, lang: str) -> float:
+        """找到指定文本中最后一个单词的结束时间"""
+        if not text_before.strip() or not word_timings:
+            return 0.0
+        
+        clean_text = text_before.strip()
+        
+        if lang and lang.startswith('zh'):
+            # 中文：查找最后一个字符的时间
+            char_count = len(clean_text)
+            if char_count > 0:
+                # 在word_timings中找到对应位置的字符
+                for i in range(char_count - 1, -1, -1):
+                    if i in word_timings:
+                        return word_timings[i]['end']
+        else:
+            # 英文：查找最后一个单词的时间
+            words = clean_text.split()
+            if words:
+                word_count = len(words)
+                if word_count > 0:
+                    # 在word_timings中找到对应位置的单词
+                    for i in range(word_count - 1, -1, -1):
+                        if i in word_timings:
+                            return word_timings[i]['end']
+        
+        return 0.0
 
     def make_layers_compatible(self, layers):
         """确保所有图层通道一致"""
