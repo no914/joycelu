@@ -480,7 +480,16 @@ class PPTSyncedConverter:
                     })
                     current_time += fallback_duration
 
-            # ==================== 5. 生成视频片段 ====================
+            # ==================== 5. 加载背景图片（只加载一次） ====================
+            try:
+                bg_img = Image.open(img_path).convert('RGBA')
+                if bg_img.size != (width, height):
+                    bg_img = bg_img.resize((width, height), Image.LANCZOS)
+            except Exception as e:
+                print(f"背景图片处理失败: {str(e)}")
+                bg_img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
+
+            # ==================== 6. 生成视频片段 ====================
             for seg_idx, seg in enumerate(segment_data):
                 try:
                     if not seg or "duration" not in seg or seg['duration'] <= 0:
@@ -488,20 +497,11 @@ class PPTSyncedConverter:
                         continue
                     seg['duration'] = min(15.0, max(0.5, seg['duration']))
 
-                    # 加载背景图片（强制匹配分辨率）
-                    try:
-                        bg_img = Image.open(img_path).convert('RGBA')
-                        if bg_img.size != (width, height):
-                            bg_img = bg_img.resize((width, height), Image.LANCZOS)
-                    except Exception as e:
-                        print(f"背景图片处理失败: {str(e)}")
-                        bg_img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
-                    
                     # 创建透明覆盖层
                     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                     draw = ImageDraw.Draw(overlay)
 
-                    # ==================== 6. 安全生成字幕 ====================
+                    # ==================== 7. 安全生成字幕 ====================
                     if seg.get("clean_text"):
                         try:
                             # 生成安全字幕图像
@@ -525,7 +525,7 @@ class PPTSyncedConverter:
                         except Exception as e:
                             print(f"字幕生成失败: {str(e)}")
 
-                    # ==================== 7. 绘制激光笔动画 ====================
+                    # ==================== 8. 绘制激光笔动画 ====================
                     if laser_points:
                         try:
                             radius = int(height * Config.LASER_RADIUS_RATIO)
@@ -573,7 +573,7 @@ class PPTSyncedConverter:
                         except Exception as e:
                             print(f"激光点处理失败: {str(e)}")
 
-                    # ==================== 8. 合并图层 ====================
+                    # ==================== 9. 合并图层 ====================
                     try:
                         final_img = Image.alpha_composite(bg_img, overlay)
                     except Exception as e:
@@ -592,7 +592,7 @@ class PPTSyncedConverter:
                         print(f"图像数组转换失败: {str(e)}")
                         img_array = np.full((height, width, 3), 255, dtype = np.uint8)
 
-                    # ==================== 9. 创建视频片段 ====================
+                    # ==================== 10. 创建视频片段 ====================
                     try:
                         final_clip = ImageClip(img_array).set_duration(seg["duration"])
 
@@ -637,7 +637,7 @@ class PPTSyncedConverter:
                     print(f"创建幻灯片片段时出错: {str(e)}")
                     continue
 
-            # ==================== 10. 合并所有片段 ====================
+            # ==================== 11. 合并所有片段 ====================
             if video_clips:
                 try:
                     loaded_clips = [VideoFileClip(v) for v in video_clips]
@@ -645,7 +645,7 @@ class PPTSyncedConverter:
                 except Exception as e:
                     print(f"合并片段失败: {str(e)}")
             
-            # ==================== 11. 回退方案 ====================
+            # ==================== 12. 回退方案 ====================
             return self._create_fallback_clip(img_path, temp_dir, index)
 
         except Exception as e:
