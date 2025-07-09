@@ -326,56 +326,66 @@ class PPTSyncedConverter:
     
     def process_audio_segment(self, text_segment, lang, speed, temp_dir, index):
         # Use MP3 extension consistently
-        temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
-        final_audio_path = os.path.join(temp_dir, f"final_audio_{index}.mp3")
-        
         try:
+            if not text_segment or not text_segment.strip():
+                duration = 1.0
+                return None, duration
+            
+            clean_text = text_segment.strip()
+            speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
+
+            estimated_duration = max(1.0, len(clean_text) * 0.15)
+            estimated_duration = min(15.0, estimated_duration)
+
+            print(f"尝试生成音频：文本长度={len(clean_text)}，预估时长={estimated_duration:.1f}秒")
+            temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
+
             # 1. Generate TTS audio
-            tts = gTTS(text=text_segment, lang=lang, slow=False)
-            tts.save(temp_audio_path)
-            
-            # 2. Validate and convert the audio file
-            if not os.path.exists(temp_audio_path):
-                raise ValueError("TTS failed to generate audio file")
+            try:
+                tts = gTTS(text=clean_text, lang=lang, slow=False)
+                tts.save(temp_audio_path)
+
+                if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) < 1024:
+                    raise ValueError("TTS生成的文件无效或太小")
                 
-            # 3. Use FFmpeg to ensure proper format
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-y',  # Overwrite without asking
-                '-i', temp_audio_path,
-                '-acodec', 'libmp3lame',  # Use standard MP3 codec
-                '-q:a', '2',  # Good quality
-                '-ar', '44100',  # Standard sample rate
-                '-ac', '2',  # Stereo
-                final_audio_path
-            ]
-            
-            # Run FFmpeg with error handling
-            result = subprocess.run(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            if result.returncode != 0:
-                raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
-                
-            # 4. Load audio with explicit format
-            audio = AudioFileClip(final_audio_path, fps=44100)
-            
-            # 5. Speed adjustment
-            if speed != 1.0:
-                audio = audio.fx(speedx, speed)
-                
-            return audio, audio.duration
-            
+                try:
+                    audio = AudioFileClip(temp_audio_path)
+                    if audio.duration <= 0 or audio.duration > 30:
+                        audio.close()
+                        raise ValueError(f"音频时常异常: {audio.duration}")
+
+                    # 5. Speed adjustment
+                    if speed != 1.0:
+                        try:
+                            audio = audio.fx(speedx, speed)
+                        except Exception as e:
+                            print(f"语速调整失败，使用原速: {str(e)}")
+
+                    final_duration = audio.duration
+                    if final_duration <= 0 or final_duration > 30:
+                        audio.close()
+                        raise ValueError(f"最终音频时长异常：{final_duration}")
+                    print(f"音频生成成功：时长={final_duration:.1f}秒")
+                    return audio, final_duration
+
+                except Exception as e:
+                    print(f"音频加载失败: {str(e)}")
+                    return None, estimated_duration
+            except Exception as e:
+                print(f"TTS生成失败：{str(e)}")
+                return None, estimated_duration
         except Exception as e:
-            print(f"音频处理失败: {str(e)}")
-            return None, 0
+            print(f"音频处理完全失败: {str(0)}")
+            fallback_duration = 2.0
+            return None, fallback_duration
+        
         finally:
             # Clean up temporary files
-            for f in [temp_audio_path]:
+            temp_files = [
+                os.path.join(temp_dir, f"audio_{index}.mp3"),
+                os.path.join(temp_dir, f"final_audio_{index}.mp3")
+            ]
+            for f in temp_files:
                 if os.path.exists(f):
                     try:
                         os.unlink(f)
@@ -424,132 +434,204 @@ class PPTSyncedConverter:
             current_time = 0.0
 
             for i, segment in enumerate(segments):
-                clean_segment = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', segment).strip()
-                
-                # 生成语音（带错误处理）
-                if clean_segment:
-                    audio, duration = self.process_audio_segment(
-                        clean_segment, lang, speed, temp_dir, f"{index}_{i}"
-                    )
-                else:
-                    duration = 3.0 if slide_index == 0 else 1.0  # 默认时长
-                    audio = AudioClip(lambda t: 0, duration=duration)
+                try:
+                    clean_segment = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', segment).strip()
 
-                segment_data.append({
-                    "text": segment,
-                    "clean_text": clean_segment,
-                    "audio": audio,
-                    "duration": duration,
-                    "start_time": current_time,
-                    "end_time": current_time + duration
-                })
-                current_time += duration
+                    audio = None
+                    duration = 2.0
+                    
+                    # 生成语音（带错误处理）
+                    if clean_segment:
+                        try:
+                            audio, duration = self.process_audio_segment(
+                                clean_segment, lang, speed, temp_dir, f"{index}_{i}"
+                            )
+                            print(f"段落{i}: 音频={'有效' if audio else '无'}，时长={duration:.1f}秒")
+                        except Exception as e:
+                            print(f"段落{i} 音频生成异常：{str(e)}")
+                            audio = None
+                            duration = max(1.0, len(clean_segment) * 0.15)
+                    else:
+                        duration = 3.0 if slide_index == 0 else 1.5  # 默认时长
+                        print(f"段落{i}: 空文本，使用默认时长{duration:.1f}秒")
+
+                    duration = max(0.5, min(15.0, duration))
+
+                    segment_data.append({
+                        "text": segment,
+                        "clean_text": clean_segment,
+                        "audio": audio,
+                        "duration": duration,
+                        "start_time": current_time,
+                        "end_time": current_time + duration
+                    })
+                    current_time += duration
+
+                except Exception as e:
+                    print(f"段落{i}处理失败: {str(e)}")
+                    fallback_duration = 2.0
+                    segment_data.append({
+                        "text": segment if 'segment' in locals() else "fallback",
+                        "clean_text": "",
+                        "audio": None,
+                        "duration": fallback_duration,
+                        "start_time": current_time,
+                        "end_time": current_time + fallback_duration
+                    })
+                    current_time += fallback_duration
 
             # ==================== 5. 生成视频片段 ====================
-            for seg in segment_data:
+            for seg_idx, seg in enumerate(segment_data):
                 try:
+                    if not seg or "duration" not in seg or seg['duration'] <= 0:
+                        print(f"跳过无效的段落{seg_idx}")
+                        continue
+                    seg['duration'] = min(15.0, max(0.5, seg['duration']))
+
                     # 加载背景图片（强制匹配分辨率）
-                    bg_img = Image.open(img_path).convert('RGBA')
-                    if bg_img.size != (width, height):
-                        bg_img = bg_img.resize((width, height), Image.LANCZOS)
+                    try:
+                        bg_img = Image.open(img_path).convert('RGBA')
+                        if bg_img.size != (width, height):
+                            bg_img = bg_img.resize((width, height), Image.LANCZOS)
+                    except Exception as e:
+                        print(f"背景图片处理失败: {str(e)}")
+                        bg_img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
                     
                     # 创建透明覆盖层
                     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                     draw = ImageDraw.Draw(overlay)
 
                     # ==================== 6. 安全生成字幕 ====================
-                    if seg["clean_text"]:
-                        # 生成安全字幕图像
-                        subtitle_img = self._generate_safe_subtitle(
-                            text=seg["clean_text"],
-                            bg_img=bg_img,
-                            max_width=width,
-                            max_height=height
-                        )
-                        
-                        # 计算安全位置（带边界检查）
-                        y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
-                        y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
-                        
-                        x_pos = (width - subtitle_img.width) // 2
-                        x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
-                        
-                        # 合并字幕到覆盖层
-                        overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+                    if seg.get("clean_text"):
+                        try:
+                            # 生成安全字幕图像
+                            subtitle_img = self._generate_safe_subtitle(
+                                text=seg["clean_text"],
+                                bg_img=bg_img,
+                                max_width=width,
+                                max_height=height
+                            )
+                            
+                            if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
+                                # 计算安全位置（带边界检查）
+                                y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
+                                y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
+                                
+                                x_pos = (width - subtitle_img.width) // 2
+                                x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
+                                
+                                # 合并字幕到覆盖层
+                                overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+                        except Exception as e:
+                            print(f"字幕生成失败: {str(e)}")
 
                     # ==================== 7. 绘制激光笔动画 ====================
                     if laser_points:
-                        radius = int(height * Config.LASER_RADIUS_RATIO)
-                        
-                        # 找出当前时间段活跃的激光点
-                        active_points = [
-                            p for p in laser_points 
-                            if p['end'] > seg["start_time"] and p["start"] < seg["end_time"]
-                        ]
-                        
-                        for p in active_points:
-                            # 计算相对时间
-                            rel_start = max(0, p['start'] - seg["start_time"])
-                            rel_end = min(seg["duration"], p['end'] - seg["start_time"])
+                        try:
+                            radius = int(height * Config.LASER_RADIUS_RATIO)
                             
-                            if rel_start < rel_end:
-                                # 安全坐标检查
-                                x = max(radius, min(width - radius, p['x']))
-                                y = max(radius, min(height - radius, p['y']))
-                                
-                                # 绘制光晕效果
-                                draw.ellipse(
-                                    [
-                                        max(0, x - radius - 10),
-                                        max(0, y - radius - 10),
-                                        min(width - 1, x + radius + 10),
-                                        min(height - 1, y + radius + 10)
-                                    ],
-                                    fill=Config.GLOW_COLOR
-                                )
-                                
-                                # 绘制激光点核心
-                                draw.ellipse(
-                                    [
-                                        max(0, x - radius),
-                                        max(0, y - radius),
-                                        min(width - 1, x + radius),
-                                        min(height - 1, y + radius)
-                                    ],
-                                    fill=Config.LASER_COLOR
-                                )
+                            # 找出当前时间段活跃的激光点
+                            active_points = []
+                            for p in laser_points: 
+                                if (p.get('end', 0) > seg.get("start_time", 0) and
+                                    p.get('start', 0) < seg.get("end_time", seg.get("duration", 0))):
+                                    active_points.append(p)
+                            
+                            for p in active_points:
+                                try:
+                                    if 'x' not in p or 'y' not in p:
+                                        continue
+
+                                    # 安全坐标检查
+                                    x = max(radius, min(width - radius, int(p['x'])))
+                                    y = max(radius, min(height - radius, int(p['y'])))
+                                        
+                                    # 绘制光晕效果
+                                    draw.ellipse(
+                                        [
+                                            max(0, x - radius - 10),
+                                            max(0, y - radius - 10),
+                                            min(width - 1, x + radius + 10),
+                                            min(height - 1, y + radius + 10)
+                                        ],
+                                        fill=Config.GLOW_COLOR
+                                    )
+                                        
+                                    # 绘制激光点核心
+                                    draw.ellipse(
+                                        [
+                                            max(0, x - radius),
+                                            max(0, y - radius),
+                                            min(width - 1, x + radius),
+                                            min(height - 1, y + radius)
+                                        ],
+                                        fill=Config.LASER_COLOR
+                                    )
+                                except Exception as e:
+                                    print(f"激光点绘制失败: {str(e)}")
+                                    continue
+                        except Exception as e:
+                            print(f"激光点处理失败: {str(e)}")
 
                     # ==================== 8. 合并图层 ====================
-                    final_img = Image.alpha_composite(bg_img, overlay)
+                    try:
+                        final_img = Image.alpha_composite(bg_img, overlay)
+                    except Exception as e:
+                        print(f"图层合并失败: {str(e)}")
+                        final_img = bg_img
                     
                     # 确保图像数组格式正确
-                    img_array = np.array(final_img)
-                    if img_array.ndim != 3 or img_array.shape[2] != 4:
-                        img_array = np.dstack([
-                            img_array[:,:,0] if img_array.ndim == 3 else img_array,
-                            img_array[:,:,1] if img_array.ndim == 3 else img_array,
-                            img_array[:,:,2] if img_array.ndim == 3 else img_array,
-                            np.full(img_array.shape[:2], 255, dtype=np.uint8)
-                        ])
+                    try:
+                        img_array = np.array(final_img)
+                        if img_array.ndim != 3 or img_array.shape[2] not in [3, 4]:
+                            img_array = np.zeros((height, width, 3), dtype = np.uint8)
+                            img_array.fill(255)
+                        elif img_array.shape[2] == 4:
+                            img_array = img_array[:, :, :3]
+                    except Exception as e:
+                        print(f"图像数组转换失败: {str(e)}")
+                        img_array = np.full((height, width, 3), 255, dtype = np.uint8)
 
                     # ==================== 9. 创建视频片段 ====================
-                    final_clip = ImageClip(img_array).set_duration(seg["duration"])
-                    if seg["audio"]:
-                        final_clip = final_clip.set_audio(seg["audio"])
-                    
-                    # 保存临时文件
-                    temp_path = os.path.join(temp_dir, f"seg_{index}_{len(video_clips)}.mp4")
-                    final_clip.write_videofile(
-                        temp_path,
-                        fps=15,
-                        codec='libx264',
-                        audio_codec='aac',
-                        preset='ultrafast',
-                        threads=1,
-                        ffmpeg_params=['-pix_fmt', 'yuva420p', '-max_muxing_queue_size', '1024'],
-                        logger=None
-                    )
-                    video_clips.append(temp_path)
+                    try:
+                        final_clip = ImageClip(img_array).set_duration(seg["duration"])
+
+                        has_valid_audio = False
+                        if seg.get("audio") and hasattr(seg["audio"], 'duration'):
+                            try:
+                                audio_duration = seg["audio"].duration
+                                if audio_duration > 0 and abs(audio_duration - seg["duration"]) < 2.0: 
+                                    final_clip = final_clip.set_audio(seg["audio"])
+                            except Exception as e:
+                                print(f"音频添加失败: {str(e)}")
+                        
+                        # 保存临时文件
+                        temp_path = os.path.join(temp_dir, f"seg_{index}_{seg_idx}.mp4")
+                        final_clip.write_videofile(
+                            temp_path,
+                            fps=15,
+                            codec='libx264',
+                            audio_codec='aac',
+                            preset='ultrafast',
+                            threads=1,
+                            ffmpeg_params=['-pix_fmt', 'yuva420p', '-max_muxing_queue_size', '1024', '-avoid_negative_ts', 'make_zero'],
+                            logger=None,
+                            verbose = False
+                        )
+                        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
+                            video_clips.append(temp_path)
+                        else:
+                            print(f"生成的视频文件无效: {temp_path}")
+
+                        final_clip.close()
+                        if seg.get("audio"):
+                            try:
+                                seg["audio"].close()
+                            except:
+                                pass
+                    except Exception as e:
+                        print(f"视频片段创建失败: {str(e)}")
+                        continue
                     
                 except Exception as e:
                     print(f"创建幻灯片片段时出错: {str(e)}")
@@ -738,10 +820,28 @@ class PPTSyncedConverter:
     def estimate_segment_duration(self, text, lang, speed):
         """估算语音段落持续时间"""
         # 基本估算：每分钟约150个单词（英文）或300个汉字（中文）
-        words_per_minute = 150 if lang != 'zh-cn' else 300
-        word_count = len(text.split()) if lang != 'zh-cn' else len(text)
-        duration = max(1.0, (word_count / words_per_minute) * 60 / speed)
-        return min(duration, 10.0)  # 限制最长10秒
+        try:
+            if not text or not isinstance(text, str):
+                return 2.0
+            clean_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text).strip()
+            if not clean_text:
+                return 1.5
+            speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
+            if lang and lang.startwith('zh'):
+                char_count = len(clean_text)
+                chars_per_minute = 240
+                duration = max(1.0, (char_count / chars_per_minute) * 60 / speed)
+            else:
+                word_count = len(clean_text.split())
+                words_per_minute = 120
+                duration = max(1.0, (word_count / words_per_minute) * 60 / speed)
+
+            min_duration = max(1.0, len(clean_text) * 0.1)
+            duration = max(min_duration, duration)
+            return min(duration, 15.0)  # 限制最长10秒
+        except Exception as e:
+            print(f"持续时间估算失败: {str(e)}")
+            return 3.0
 
     def create_laser_animation(self, slide_path, points, resolution):
         try:
@@ -823,100 +923,135 @@ class PPTSyncedConverter:
             return []
         
         if slide_width <= 0 or slide_height <= 0:
-            raise ValueError(f"无效的分辨率: {slide_width}x{slide_height}")
+            print(f"警告: 无效的分辨率 {slide_width}x{slide_height}，使用默认值")
+            slide_width, slide_height = 1280, 720
 
         print(f"🔍 原始备注文本: '{note_text}'")
         
-        # 分割文本和激光指令
-        parts = []
-        last_end = 0
-        cursor_pattern = re.compile(r'\[cursor:\s*(\d+),\s*(\d+)\]|\[cursor:\s*off\]')
-        
-        for match in cursor_pattern.finditer(note_text):
-            # 添加前面的文本
-            if last_end < match.start():
-                parts.append(('text', note_text[last_end:match.start()]))
-            # 添加激光指令
-            parts.append(('cursor', match.group()))
-            last_end = match.end()
-        
-        # 添加剩余文本
-        if last_end < len(note_text):
-            parts.append(('text', note_text[last_end:]))
-        
-        # 计算时间权重
-        text_weight = sum(len(p[1]) for p in parts if p[0] == 'text')
-        cursor_count = len([p for p in parts if p[0] == 'cursor'])
-        total_weight = text_weight + cursor_count
-        
-        if total_weight == 0:
-            return []
-        
-        # 计算总持续时间
-        total_duration = duration if duration else sum(
-            self.estimate_segment_duration(p[1], 'zh-cn', 1.0) 
-            for p in parts if p[0] == 'text'
-        ) or 5.0  # 默认5秒
-        
-        laser_points = []
-        current_point = None
-        current_time = 0.0
-        
-        for part_type, part_content in parts:
-            if part_type == 'text':
-                # 文本部分的时间权重
-                weight = len(part_content)
-                segment_duration = (weight / total_weight) * total_duration
-                
-                # 更新当前激光点的结束时间
-                if current_point:
-                    current_point['end'] = current_time + segment_duration
-                
-                current_time += segment_duration
-                
-            elif part_type == 'cursor':
-                if 'off' in part_content:
-                    # 结束当前激光点
-                    if current_point:
-                        laser_points.append(current_point)
-                        current_point = None
-                else:
-                    # 开始新激光点
-                    if current_point:
-                        laser_points.append(current_point)
+        try:
+            # 分割文本和激光指令
+            parts = []
+            last_end = 0
+            cursor_pattern = re.compile(r'\[cursor:\s*(\d+),\s*(\d+)\]|\[cursor:\s*off\]')
+            
+            for match in cursor_pattern.finditer(note_text):
+                # 添加前面的文本
+                if last_end < match.start():
+                    text_part = note_text[last_end:match.start()].strip()
+                    if text_part:
+                        parts.append(('text', text_part))
+                # 添加激光指令
+                parts.append(('cursor', match.group()))
+                last_end = match.end()
+            
+            # 添加剩余文本
+            if last_end < len(note_text):
+                remaining_text = note_text[last_end:].strip()
+                if remaining_text:
+                    parts.append(('text', remaining_text))
+            
+            if not any(p[0] == 'text' for p in parts):
+                parts.insert(0, ('text', 'default_content'))
+            
+            # 计算时间权重
+            text_parts = [p[1] for p in parts if p[0] == 'text']
+            text_weight = sum(max(1, len(text)) for text in text_parts)
+            cursor_count = len([p for p in parts if p[0] == 'cursor'])
+            total_weight = max(1, text_weight + cursor_count)
+            
+            # 计算总持续时间
+            if duration and duration > 0:
+                total_duration = min(60.0, max(1.0, duration))
+            else:
+                estimated_duration = 0
+                for text in text_parts:
+                    estimated_duration += max(1.0, len(text) * 0.15)
+                total_duration = min(30.0, max(3.0, estimated_duration))
+
+            print(f"计算的持续总时间: {total_duration}秒")
+            
+            laser_points = []
+            current_point = None
+            current_time = 0.0
+            time_step = total_duration / max(1, len(parts))
+            
+            for i, (part_type, part_content) in enumerate(parts):
+                if part_type == 'text':
+                    # 文本部分的时间权重
+                    weight = max(1, len(part_content))
+                    segment_duration = max(0.5, (weight / total_weight) * total_duration)
+
+                    if current_time + segment_duration > total_duration:
+                        segment_duration = max(0.1, total_duration - current_time)
                     
-                    # 解析坐标（带边界检查）
-                    coords = re.findall(r'\d+', part_content)
-                    if len(coords) == 2:
-                        try:
-                            # 确保百分比在0-100范围内
-                            x_percent = min(100, max(0, float(coords[0])))
-                            y_percent = min(100, max(0, float(coords[1])))
-                            
-                            # 计算实际像素坐标
-                            x = int(slide_width * x_percent / 100)
-                            y = int(slide_height * y_percent / 100)
-                            
-                            # 二次验证坐标
-                            x = max(0, min(slide_width - 1, x))
-                            y = max(0, min(slide_height - 1, y))
-                            
-                            current_point = {
-                                'x': x,
-                                'y': y,
-                                'start': current_time,
-                                'end': total_duration  # 默认持续到结束
-                            }
-                        except (ValueError, TypeError) as e:
-                            print(f"坐标解析错误: {str(e)}")
-                            continue
-        
-        # 处理最后一个激光点
-        if current_point:
-            laser_points.append(current_point)
-        
-        print(f"🔧 解析后的激光点: {laser_points}")
-        return laser_points
+                    # 更新当前激光点的结束时间
+                    if current_point:
+                        safe_end_time = min(total_duration, current_time + segment_duration)
+                        current_point['end'] = max(current_point['start'] + 0.1, safe_end_time)
+                    
+                    current_time = min(total_duration, current_time + segment_duration)
+                    
+                elif part_type == 'cursor':
+                    if 'off' in part_content.lower():
+                        # 结束当前激光点
+                        if current_point:
+                            current_point['end'] = max(current_point['start'] + 0.1,
+                                                       min(current_time, total_duration))
+                            laser_points.append(current_point)
+                            current_point = None
+                    else:
+                        # 开始新激光点
+                        if current_point:
+                            current_point['end'] = max(current_point['start'] + 0.1, current_time)
+                            laser_points.append(current_point)
+                        
+                        # 解析坐标（带边界检查）
+                        coords = re.findall(r'\d+', part_content)
+                        if len(coords) >= 2:
+                            try:
+                                # 确保百分比在0-100范围内
+                                x_percent = min(100, max(0, float(coords[0])))
+                                y_percent = min(100, max(0, float(coords[1])))
+                                
+                                # 计算实际像素坐标
+                                x = max(0, min(slide_width - 1, int(slide_width * x_percent / 100)))
+                                y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
+
+                                start_time = max(0.0, min(current_time, total_duration - 0.5))
+                                
+                                current_point = {
+                                    'x': x,
+                                    'y': y,
+                                    'start': start_time,
+                                    'end': min(total_duration, start_time + 1.0)  # 默认持续到结束
+                                }
+                            except (ValueError, TypeError) as e:
+                                print(f"坐标解析错误: {str(e)}")
+                                continue
+            
+            # 处理最后一个激光点
+            if current_point:
+                current_point['end'] = max(current_point['start'] + 0.1,
+                                           min(total_duration, current_point['start'] + 2.0))
+                laser_points.append(current_point)
+
+            validated_points = []
+            for point in laser_points:
+                start = max(0.0, min(total_duration - 0.1, point['start']))
+                end = max(start + 0.1, min(total_duration, point['end']))
+                if end > start and start >= 0:
+                    validated_points.append({
+                        'x': point['x'],
+                        'y': point['y'],
+                        'start': start,
+                        'end': end
+                    })
+            
+            print(f"🔧 解析后的激光点: {validated_points}")
+            return validated_points
+        except Exception as e:
+            print(f"激光点解析错误: {str(e)}")
+            return []
 
     def make_layers_compatible(self, layers):
         """确保所有图层通道一致"""
