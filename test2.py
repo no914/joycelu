@@ -830,7 +830,7 @@ class PPTSyncedConverter:
             if not clean_text:
                 return 1.5
             speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
-            if lang and lang.startwith('zh'):
+            if lang and lang.startswith('zh'):
                 char_count = len(clean_text)
                 chars_per_minute = 240
                 duration = max(1.0, (char_count / chars_per_minute) * 60 / speed)
