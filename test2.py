@@ -654,14 +654,16 @@ class PPTSyncedConverter:
 
     def _generate_safe_subtitle(self, text, bg_img, max_width, max_height):
         try:
-            # Handle case where bg_img is already an Image object
+            # Get image dimensions from bg_img without using the background
             if isinstance(bg_img, Image.Image):
-                img = bg_img.copy()
+                img_size = bg_img.size
             else:
                 # Assume it's a file path
-                img = Image.open(bg_img).convert("RGBA")
+                temp_img = Image.open(bg_img).convert("RGBA")
+                img_size = temp_img.size
                 
-            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            # Create ONLY the subtitle overlay (no background)
+            overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(overlay)
             
             font_size = self.calculate_font_size(text, (max_width, max_height))
@@ -686,20 +688,20 @@ class PPTSyncedConverter:
             
             bg_width = max_line_width + 2 * self.subtitle_style['padding']
             bg_height = total_height + 2 * self.subtitle_style['padding']
-            y_position = img.size[1] * self.subtitle_style['position_y']
+            y_position = img_size[1] * self.subtitle_style['position_y']
             bg_y1 = y_position - bg_height // 2
             bg_y2 = y_position + bg_height // 2
             
             draw.rectangle(
-                [(img.size[0] - bg_width) // 2, bg_y1,
-                (img.size[0] + bg_width) // 2, bg_y2],
+                [(img_size[0] - bg_width) // 2, bg_y1,
+                (img_size[0] + bg_width) // 2, bg_y2],
                 fill=self.subtitle_style['bg_color']
             )
             
             current_y = bg_y1 + self.subtitle_style['padding']
             for i, line in enumerate(lines):
                 text_width = font.getlength(line)
-                x = (img.size[0] - text_width) // 2
+                x = (img_size[0] - text_width) // 2
                 draw.text(
                     (x, current_y),
                     line,
@@ -710,17 +712,18 @@ class PPTSyncedConverter:
                 )
                 current_y += line_heights[i]
             
-            final_img = Image.alpha_composite(img, overlay)
-            return final_img
+            # Return ONLY the subtitle overlay, not composited with background
+            return overlay
         
         except Exception as e:
             print(f"生成字幕图片失败: {str(e)}")
-            # Create error image
-            img = Image.new("RGB", (max_width, max_height), (255, 255, 255))
-            draw = ImageDraw.Draw(img)
-            draw.rectangle([(0,0), (img.size[0]-1,img.size[1]-1)], outline="red", width=5)
-            draw.text((10,10), "Subtitle Error", fill="red")
-            return img
+            # Create error overlay (transparent background with error text)
+            error_overlay = Image.new("RGBA", (max_width, max_height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(error_overlay)
+            # Add semi-transparent red background for error
+            draw.rectangle([(10, 10), (max_width-10, 50)], fill=(255, 0, 0, 128))
+            draw.text((15, 15), "Subtitle Error", fill=(255, 255, 255, 255))
+            return error_overlay
 
     def _split_text_lines(self, text, max_chars, max_pixel_width):
         """将文本分割为适合显示的行"""
