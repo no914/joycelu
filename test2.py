@@ -1114,6 +1114,37 @@ class PPTSyncedConverter:
         
         return 0.0
 
+    def _find_word_end_time_in_segment(self, text_before: str, word_timings: Dict, lang: str) -> float:
+        """找到指定文本中最后一个单词的结束时间（段落内相对时间）"""
+        if not text_before.strip() or not word_timings:
+            return 0.0
+        
+        clean_text = text_before.strip()
+        
+        if lang and lang.startswith('zh'):
+            # 中文：查找最后一个字符的时间
+            char_count = len(clean_text)
+            if char_count > 0:
+                # 在word_timings中找到对应位置的字符
+                for i in range(char_count - 1, -1, -1):
+                    if i in word_timings:
+                        print(f"📍 找到字符 '{word_timings[i]['word']}' 在位置{i}, 结束时间: {word_timings[i]['end']:.1f}s")
+                        return word_timings[i]['end']
+        else:
+            # 英文：查找最后一个单词的时间
+            words = clean_text.split()
+            if words:
+                word_count = len(words)
+                if word_count > 0:
+                    # 在word_timings中找到对应位置的单词
+                    for i in range(word_count - 1, -1, -1):
+                        if i in word_timings:
+                            print(f"📍 找到单词 '{word_timings[i]['word']}' 在位置{i}, 结束时间: {word_timings[i]['end']:.1f}s")
+                            return word_timings[i]['end']
+        
+        print(f"⚠️ 未找到单词时间映射")
+        return 0.0
+
     def parse_laser_actions_from_segments(self, segment_data: List[Dict], 
                                          slide_width: int = 1920, slide_height: int = 1080,
                                          lang: str = 'zh-cn', speed: float = 1.0) -> List[Dict]:
@@ -1151,6 +1182,8 @@ class PPTSyncedConverter:
                         'end': timing['end'] + segment_start
                     }
                 
+                print(f"🕒 段落{seg_idx}单词时间映射: {len(adjusted_word_timings)}个单词")
+                
                 # 处理该段落中的激光指令
                 current_laser = None
                 
@@ -1165,12 +1198,17 @@ class PPTSyncedConverter:
                     if 'off' in cursor_cmd.lower():
                         if current_laser:
                             # 计算结束时间
-                            end_time = self._find_word_end_time(clean_text_before, adjusted_word_timings, lang)
-                            if end_time == 0:  # 如果找不到准确时间，使用段落内的相对位置
+                            print(f"🔍 查找结束时间，文本: '{clean_text_before}'")
+                            end_time = self._find_word_end_time_in_segment(clean_text_before, word_timings, lang)
+                            if end_time <= 0:  # 如果找不到准确时间，使用段落内的相对位置
                                 relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
                                 end_time = segment_start + (segment_duration * relative_pos)
+                                print(f"🔧 使用相对位置计算结束时间: {relative_pos:.2f} -> {end_time:.1f}s")
+                            else:
+                                end_time = end_time + segment_start  # 转换为绝对时间
+                                print(f"🔧 基于单词计算结束时间: {end_time:.1f}s")
                             
-                            current_laser['end'] = min(segment_end, end_time)
+                            current_laser['end'] = min(segment_end, max(current_laser['start'] + 0.1, end_time))
                             laser_points.append(current_laser)
                             print(f"🔴 激光点结束: {current_laser['start']:.1f}s - {current_laser['end']:.1f}s")
                             current_laser = None
@@ -1185,10 +1223,15 @@ class PPTSyncedConverter:
                                 y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
                                 
                                 # 计算开始时间
-                                start_time = self._find_word_end_time(clean_text_before, adjusted_word_timings, lang)
-                                if start_time == 0:  # 如果找不到准确时间，使用段落内的相对位置
+                                print(f"🔍 查找开始时间，文本: '{clean_text_before}'")
+                                start_time = self._find_word_end_time_in_segment(clean_text_before, word_timings, lang)
+                                if start_time <= 0:  # 如果找不到准确时间，使用段落内的相对位置
                                     relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
                                     start_time = segment_start + (segment_duration * relative_pos)
+                                    print(f"🔧 使用相对位置计算开始时间: {relative_pos:.2f} -> {start_time:.1f}s")
+                                else:
+                                    start_time = start_time + segment_start  # 转换为绝对时间
+                                    print(f"🔧 基于单词计算开始时间: {start_time:.1f}s")
                                 
                                 current_laser = {
                                     'x': x,
