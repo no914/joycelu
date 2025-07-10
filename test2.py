@@ -10,6 +10,7 @@ from moviepy.video.fx.all import speedx
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from gtts import gTTS
 from pptx import Presentation
+import comtypes
 import comtypes.client
 from googletrans import Translator
 import warnings
@@ -148,6 +149,9 @@ class PPTSyncedConverter:
 
     def ppt_to_images(self, pptx_path, output_dir, resolution=(1920, 1080)):
         powerpoint = None
+        deck = None
+        com_initialized = False
+        
         try:
             # 验证输入路径
             pptx_path = self._ensure_path(pptx_path)
@@ -155,7 +159,11 @@ class PPTSyncedConverter:
             
             self.update_progress("正在初始化PPT")
             comtypes.CoInitialize()
+            com_initialized = True
+            
             powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
+            powerpoint.Visible = False  # 隐藏PowerPoint窗口
+            
             deck = powerpoint.Presentations.Open(pptx_path)
 
             slide_count = deck.Slides.Count
@@ -176,14 +184,39 @@ class PPTSyncedConverter:
             
             self.update_progress("PPT转换完成!")
             return True
+            
         except Exception as e:
             print(f"PPT转换错误: {str(e)}")
+            print(f"错误详情: {type(e).__name__}")
+            
+            # 检查是否是comtypes相关错误
+            if "comtypes" in str(e).lower():
+                print("提示: 这可能是comtypes库的问题。请尝试以下解决方案：")
+                print("1. 重新安装comtypes: pip uninstall comtypes && pip install comtypes")
+                print("2. 确保在Windows系统上运行")
+                print("3. 确保PowerPoint已安装")
+            
             return False
+            
         finally:
-            if powerpoint:
-                deck.Close()
-                powerpoint.Quit()
-                comtypes.CoUninitialize()
+            # 安全清理资源
+            try:
+                if deck:
+                    deck.Close()
+            except:
+                pass
+                
+            try:
+                if powerpoint:
+                    powerpoint.Quit()
+            except:
+                pass
+                
+            try:
+                if com_initialized:
+                    comtypes.CoUninitialize()
+            except:
+                pass
 
     def is_english(self, text):
         return all(ord(c) < 128 for c in text)
@@ -999,8 +1032,13 @@ class PPTSyncedConverter:
                 # ==================== 4. PPT转图片 ====================
                 slide_images = []
                 self.update_progress("正在将PPT转换为图片...")
+                
+                # 尝试使用PowerPoint COM接口转换
                 if not self.ppt_to_images(pptx_path, temp_dir, resolution):
-                    raise RuntimeError("PPT转图片失败")
+                    # 如果PowerPoint转换失败，尝试使用python-pptx备用方法
+                    self.update_progress("PowerPoint转换失败，尝试备用方法...")
+                    if not self._ppt_to_images_fallback(pptx_path, temp_dir, resolution):
+                        raise RuntimeError("PPT转图片失败：PowerPoint和备用方法都不可用")
                 
                 slide_images = sorted(glob.glob(os.path.join(temp_dir, "slide_*.png")))
                 if len(slide_images) != len(self.prs.slides):
