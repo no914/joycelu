@@ -218,6 +218,172 @@ class PPTSyncedConverter:
             except:
                 pass
 
+    def _ppt_to_images_fallback(self, pptx_path, output_dir, resolution=(1920, 1080)):
+        """备用PPT转图片方法，使用python-pptx + PIL创建简单的幻灯片图片"""
+        try:
+            from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+            
+            self.update_progress("使用备用方法处理PPT...")
+            prs = Presentation(pptx_path)
+            
+            width, height = resolution
+            slide_count = len(prs.slides)
+            
+            for i, slide in enumerate(prs.slides):
+                try:
+                    # 创建空白图片
+                    img = Image.new('RGB', (width, height), (255, 255, 255))
+                    draw = ImageDraw.Draw(img)
+                    
+                    # 添加标题
+                    title_text = f"幻灯片 {i+1}"
+                    
+                    # 尝试获取幻灯片标题
+                    try:
+                        for shape in slide.shapes:
+                            if hasattr(shape, 'text') and shape.text.strip():
+                                title_text = shape.text.strip()
+                                break
+                    except:
+                        pass
+                    
+                    # 绘制简单的幻灯片表示
+                    try:
+                        # 获取字体
+                        title_font_size = max(32, height // 15)
+                        content_font_size = max(20, height // 25)
+                        
+                        try:
+                            # 尝试使用系统字体
+                            if self.is_english(title_text):
+                                title_font = ImageFont.truetype("arial.ttf", title_font_size)
+                                content_font = ImageFont.truetype("arial.ttf", content_font_size)
+                            else:
+                                # 中文字体
+                                title_font = ImageFont.truetype("simhei.ttf", title_font_size)
+                                content_font = ImageFont.truetype("simhei.ttf", content_font_size)
+                        except:
+                            # 使用默认字体
+                            try:
+                                title_font = ImageFont.load_default(size=title_font_size)
+                                content_font = ImageFont.load_default(size=content_font_size)
+                            except:
+                                title_font = ImageFont.load_default()
+                                content_font = ImageFont.load_default()
+                        
+                        # 收集所有文本内容
+                        all_texts = []
+                        try:
+                            for shape in slide.shapes:
+                                if hasattr(shape, 'text') and shape.text.strip():
+                                    text = shape.text.strip()
+                                    if text not in all_texts:  # 避免重复
+                                        all_texts.append(text)
+                        except:
+                            pass
+                        
+                        # 如果没有文本，使用默认标题
+                        if not all_texts:
+                            all_texts = [f"幻灯片 {i+1}"]
+                        
+                        # 绘制背景渐变效果
+                        for y in range(0, height, 2):
+                            color_value = 255 - int((y / height) * 30)  # 轻微渐变
+                            draw.line([(0, y), (width, y)], fill=(color_value, color_value, color_value))
+                        
+                        # 绘制边框
+                        border_width = 8
+                        draw.rectangle([0, 0, width-1, height-1], outline=(80, 120, 200), width=border_width)
+                        
+                        # 绘制标题（第一个文本作为标题）
+                        main_title = all_texts[0] if all_texts else f"幻灯片 {i+1}"
+                        
+                        # 计算标题位置
+                        try:
+                            title_bbox = draw.textbbox((0, 0), main_title, font=title_font)
+                            title_width = title_bbox[2] - title_bbox[0]
+                            title_height = title_bbox[3] - title_bbox[1]
+                        except:
+                            title_width = len(main_title) * title_font_size // 2
+                            title_height = title_font_size
+                        
+                        title_x = max(20, (width - title_width) // 2)
+                        title_y = max(30, height // 8)
+                        
+                        # 绘制标题阴影
+                        draw.text((title_x + 2, title_y + 2), main_title, fill=(128, 128, 128), font=title_font)
+                        # 绘制标题
+                        draw.text((title_x, title_y), main_title, fill=(20, 50, 120), font=title_font)
+                        
+                        # 绘制其他内容（如果有）
+                        if len(all_texts) > 1:
+                            content_y = title_y + title_height + 40
+                            line_height = content_font_size + 10
+                            
+                            for idx, text in enumerate(all_texts[1:], 1):
+                                if content_y + line_height > height - 80:  # 留空间给页码
+                                    break
+                                
+                                # 限制文本长度
+                                if len(text) > 50:
+                                    text = text[:47] + "..."
+                                
+                                draw.text((40, content_y), f"• {text}", fill=(50, 50, 50), font=content_font)
+                                content_y += line_height
+                        
+                        # 添加页码和信息
+                        page_text = f"第 {i+1} 页 / 共 {slide_count} 页"
+                        info_text = "备用方法生成"
+                        
+                        try:
+                            page_bbox = draw.textbbox((0, 0), page_text, font=content_font)
+                            page_width = page_bbox[2] - page_bbox[0]
+                        except:
+                            page_width = len(page_text) * content_font_size // 2
+                        
+                        page_x = width - page_width - 20
+                        page_y = height - 60
+                        
+                        draw.text((page_x, page_y), page_text, fill=(100, 100, 100), font=content_font)
+                        draw.text((20, page_y), info_text, fill=(150, 150, 150), font=content_font)
+                        
+                    except Exception as e:
+                        print(f"绘制幻灯片{i+1}内容失败: {str(e)}")
+                        # 最简单的回退方案
+                        draw.text((50, height//2), f"幻灯片 {i+1}", fill=(0, 0, 0))
+                    
+                    # 保存图片
+                    img_path = os.path.join(output_dir, f"slide_{i+1:03d}.png")
+                    img.save(img_path, "PNG")
+                    
+                    self.update_progress(f"备用方法转换第{i+1}/{slide_count}页...", (i+1)/slide_count)
+                    
+                except Exception as e:
+                    print(f"处理幻灯片{i+1}失败: {str(e)}")
+                    # 创建错误页面
+                    error_img = Image.new('RGB', (width, height), (255, 200, 200))
+                    error_draw = ImageDraw.Draw(error_img)
+                    
+                    # 安全的错误页面文本绘制
+                    error_text = f"幻灯片 {i+1} 处理失败"
+                    try:
+                        error_font = ImageFont.load_default()
+                        error_draw.text((50, height//2), error_text, fill=(255, 0, 0), font=error_font)
+                    except:
+                        # 最基本的文本绘制
+                        error_draw.text((50, height//2), error_text, fill=(255, 0, 0))
+                    
+                    img_path = os.path.join(output_dir, f"slide_{i+1:03d}.png")
+                    error_img.save(img_path, "PNG")
+            
+            self.update_progress("备用方法转换完成!")
+            return True
+            
+        except Exception as e:
+            print(f"备用PPT转换方法失败: {str(e)}")
+            return False
+
     def is_english(self, text):
         return all(ord(c) < 128 for c in text)
     
