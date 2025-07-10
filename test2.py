@@ -440,7 +440,7 @@ class PPTSyncedConverter:
                     def make_frame(t):
                         try:
                             return self._generate_frame_with_precise_laser(
-                                bg_img, t, segment_data, all_laser_points, width, height
+                                bg_img, t, segment_data, all_laser_points, width, height, lang, speed
                             )
                         except Exception as e:
                             print(f"Frame generation error at t={t:.2f}: {str(e)}")
@@ -489,7 +489,184 @@ class PPTSyncedConverter:
             traceback.print_exc()
             return self._create_fallback_clip(img_path, temp_dir, index)
 
+    def _calculate_line_timings(self, text, total_duration, lang='zh-cn', speed=1.0):
+        """计算每行文本的显示时间，支持自动换行"""
+        cursor_pattern = re.compile(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]')
+        clean_text = re.sub(cursor_pattern, '', text)
+        
+        if not clean_text.strip():
+            return []
+        
+        # 首先按换行符分割
+        natural_lines = clean_text.split('\n')
+        natural_lines = [line.strip() for line in natural_lines if line.strip()]
+        
+        if not natural_lines:
+            return []
+        
+        # 如果只有一行但很长，需要进一步分割
+        final_lines = []
+        for line in natural_lines:
+            if len(line) > 30:  # 中文30字符或英文30字符为一行
+                # 自动分割长行
+                if lang and lang.startswith('zh'):
+                    # 中文按标点符号分割
+                    import re
+                    parts = re.split(r'([，。！？；：])', line)
+                    current_part = ""
+                    for part in parts:
+                        if current_part and len(current_part + part) > 30:
+                            if current_part.strip():
+                                final_lines.append(current_part.strip())
+                            current_part = part
+                        else:
+                            current_part += part
+                    if current_part.strip():
+                        final_lines.append(current_part.strip())
+                else:
+                    # 英文按单词分割
+                    words = line.split()
+                    current_line = ""
+                    for word in words:
+                        if current_line and len(current_line + " " + word) > 30:
+                            final_lines.append(current_line.strip())
+                            current_line = word
+                        else:
+                            current_line = current_line + " " + word if current_line else word
+                    if current_line.strip():
+                        final_lines.append(current_line.strip())
+            else:
+                final_lines.append(line)
+        
+        if not final_lines:
+            return []
+        
+        line_timings = []
+        current_time = 0.0
+        
+        if lang and lang.startswith('zh'):
+            # 中文按字符计算
+            total_chars = sum(len(line) for line in final_lines)
+            char_duration = total_duration / total_chars if total_chars > 0 else 0
+            
+            for line in final_lines:
+                line_char_count = len(line)
+                line_duration = line_char_count * char_duration
+                line_timings.append({
+                    'text': line,
+                    'start': current_time,
+                    'end': current_time + line_duration
+                })
+                current_time += line_duration
+        else:
+            # 英文按单词计算
+            total_words = sum(len(line.split()) for line in final_lines)
+            word_duration = total_duration / total_words if total_words > 0 else 0
+            
+            for line in final_lines:
+                words_in_line = len(line.split())
+                line_duration = words_in_line * word_duration
+                line_timings.append({
+                    'text': line,
+                    'start': current_time,
+                    'end': current_time + line_duration
+                })
+                current_time += line_duration
+        
+        return line_timings
+
+    def _generate_progressive_subtitle(self, text, bg_img, max_width, max_height, current_time, segment_start, segment_duration, lang='zh-cn', speed=1.0):
+        """生成逐行显示的字幕"""
+        try:
+            # Handle case where bg_img is already an Image object
+            if isinstance(bg_img, Image.Image):
+                img_size = bg_img.size
+            else:
+                # Assume it's a file path                
+                temp_img = Image.open(bg_img).convert("RGBA")
+                img_size = temp_img.size
+                
+            overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            
+            # 计算每行的时间
+            line_timings = self._calculate_line_timings(text, segment_duration, lang, speed)
+            if not line_timings:
+                return overlay
+            
+            # 计算相对于段落开始的时间
+            relative_time = current_time - segment_start
+            
+            # 找出当前时间应该显示的行
+            visible_lines = []
+            for line_info in line_timings:
+                if line_info['start'] <= relative_time:
+                    visible_lines.append(line_info['text'])
+                else:
+                    break
+            
+            if not visible_lines:
+                return overlay
+            
+            # 生成字幕
+            font_size = self.calculate_font_size('\n'.join(visible_lines), (max_width, max_height))            
+            try:
+                if self.is_english(text):
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                else:
+                    font = ImageFont.truetype("simhei.ttf", font_size)
+            except:
+                font = ImageFont.load_default(size=font_size)
+                print("警告：使用默认字体，可能不支持中文")
+
+            # 计算背景大小
+            line_bboxes = [font.getbbox(line) for line in visible_lines]
+            line_widths = [bbox[2] - bbox[0] for bbox in line_bboxes]
+            line_heights = [bbox[3] - bbox[1] for bbox in line_bboxes]
+            total_height = sum(line_heights)
+            max_line_width = max(line_widths) if line_widths else 0
+            
+            bg_width = max_line_width + 2 * self.subtitle_style['padding']
+            bg_height = total_height + 2 * self.subtitle_style['padding']
+            y_position = img_size[1] * self.subtitle_style['position_y']
+            bg_y1 = y_position - bg_height // 2
+            bg_y2 = y_position + bg_height // 2
+            
+            # 绘制背景
+            draw.rectangle(
+                [(img_size[0] - bg_width) // 2, bg_y1,
+                (img_size[0] + bg_width) // 2, bg_y2],
+                fill=self.subtitle_style['bg_color']
+            )
+            
+            # 绘制文字
+            current_y = bg_y1 + self.subtitle_style['padding']
+            for i, line in enumerate(visible_lines):
+                text_width = font.getlength(line)
+                x = (img_size[0] - text_width) // 2
+                draw.text(
+                    (x, current_y),
+                    line,
+                    font=font,
+                    fill=self.subtitle_style['text_color'],
+                    stroke_width=2,
+                    stroke_fill=(0, 0, 0)
+                )
+                current_y += line_heights[i]
+
+            print(f"时间 {current_time:.2f}s: 显示 {len(visible_lines)} 行字幕")
+            return overlay        
+        except Exception as e:
+            print(f"生成逐行字幕失败: {str(e)}")
+            # Create error image            
+            error_overlay = Image.new("RGBA", (max_width, max_height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(error_overlay)
+            draw.rectangle([(10,10), (max_width - 10, 50)], fill=(255, 0, 0, 128))
+            draw.text((15,10), "Subtitle Error", fill=(255, 255, 255, 255))
+            return error_overlay
+
     def _generate_safe_subtitle(self, text, bg_img, max_width, max_height):
+        """保留原有的字幕生成方法作为备用"""
         try:
             # Handle case where bg_img is already an Image object
             if isinstance(bg_img, Image.Image):
@@ -798,8 +975,8 @@ class PPTSyncedConverter:
         
         return char_timings
     
-    def _generate_frame_with_precise_laser(self, bg_img, t, segment_data, all_laser_points, width, height):
-        """根据时间t生成包含精确激光点的帧"""
+    def _generate_frame_with_precise_laser(self, bg_img, t, segment_data, all_laser_points, width, height, lang='zh-cn', speed=1.0):
+        """根据时间t生成包含精确激光点和逐行字幕的帧"""
         try:
             print(f"\n生成帧时间: {t:.2f}s")
             # 创建背景图像副本
@@ -816,14 +993,19 @@ class PPTSyncedConverter:
                     current_segment = seg
                     break
             
-            # 绘制字幕
+            # 绘制逐行字幕
             if current_segment and current_segment.get("clean_text"):
                 try:
-                    subtitle_img = self._generate_safe_subtitle(
+                    subtitle_img = self._generate_progressive_subtitle(
                         text=current_segment["clean_text"],
                         bg_img=frame_img,
                         max_width=width,
-                        max_height=height
+                        max_height=height,
+                        current_time=t,
+                        segment_start=current_segment.get("start_time", 0),
+                        segment_duration=current_segment.get("duration", 0),
+                        lang=lang,
+                        speed=speed
                     )
                     
                     if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
@@ -833,7 +1015,24 @@ class PPTSyncedConverter:
                         x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
                         overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
                 except Exception as e:
-                    print(f"帧{t:.2f}s字幕生成失败: {str(e)}")
+                    print(f"帧{t:.2f}s逐行字幕生成失败: {str(e)}")
+                    # 回退到普通字幕
+                    try:
+                        subtitle_img = self._generate_safe_subtitle(
+                            text=current_segment["clean_text"],
+                            bg_img=frame_img,
+                            max_width=width,
+                            max_height=height
+                        )
+                        
+                        if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
+                            y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
+                            y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
+                            x_pos = (width - subtitle_img.width) // 2                        
+                            x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
+                            overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+                    except Exception as e2:
+                        print(f"帧{t:.2f}s备用字幕生成失败: {str(e2)}")
             
             print("所有激光点信息:")
             for i, point in enumerate(all_laser_points):
