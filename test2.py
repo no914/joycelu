@@ -575,10 +575,11 @@ class PPTSyncedConverter:
             return ImageClip(blank).set_duration(3.0)
 
     def _split_text_segments(self, text):
-        """辅助方法：分割文本为语音段落"""
+        """辅助方法：分割文本为语音段落，确保激光点指令和对应的off指令在同一段落"""
         segments = []
         current_segment = ""        
         cursor_pattern = re.compile(r'(\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\])')
+        has_active_cursor = False  # 跟踪当前段落是否有未关闭的激光点
         
         for line in text.split('\n'):
             if line.strip():
@@ -589,16 +590,23 @@ class PPTSyncedConverter:
                         
                     if cursor_pattern.match(part):
                         current_segment += part
-                        if current_segment.strip():
-                            segments.append(current_segment)
-                            current_segment = ""
+                        # 检查是否是激光点开启或关闭指令
+                        if 'off' in part.lower():
+                            has_active_cursor = False  # 激光点关闭
+                            # 如果遇到 [cursor: off]，这个段落可以结束
+                            if current_segment.strip():
+                                segments.append(current_segment)
+                                current_segment = ""
+                        else:
+                            has_active_cursor = True  # 激光点开启
                     else:
                         current_segment += part
-                        if part.endswith(('。', '!', '?', ';')):                            
+                        # 只有在没有活跃激光点时，才在句子结束处分割
+                        if not has_active_cursor and part.endswith(('。', '!', '?', ';')):                            
                             segments.append(current_segment)
                             current_segment = ""
 
-        if current_segment:
+        if current_segment.strip():
             segments.append(current_segment)
         
         return segments
