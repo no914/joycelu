@@ -399,18 +399,19 @@ class PPTSyncedConverter:
                     current_time += fallback_duration
 
             # ==================== 5. 生成视频片段 ====================
-            laser_points = []
+            all_laser_points = []
             print(f"原始备注文本: {notes_text}")
             print(f"分割后的段落: {segments}")
             for segment in segment_data:
-                laser_points = self.parse_laser_actions(
+                segment_laser_points = self.parse_laser_actions(
                     text=segment["text"],  # 统一使用segment
                     segment_start=segment["start_time"],
                     segment_duration=segment["duration"],
                     slide_width=width,
                     slide_height=height
                 )
-                print(f"基于段落解析的激光点: {laser_points}")
+                print(f"基于段落解析的激光点: {segment_laser_points}")
+                all_laser_points.extend(segment_laser_points)
 
             try:
                 bg_img = Image.open(img_path).convert('RGBA')
@@ -456,23 +457,34 @@ class PPTSyncedConverter:
                             print(f"字幕生成失败: {str(e)}")
 
                     # ==================== 7. 绘制激光笔动画 ====================
-                    if laser_points:
+                    if all_laser_points:
                         try:
                             radius = int(height * Config.LASER_RADIUS_RATIO)
+                            
+                            # 检查当前段落文本是否包含激光点指令
+                            current_seg_text = seg.get("text", "")
+                            has_cursor_on = '[cursor:' in current_seg_text and '[cursor: off]' not in current_seg_text
+                            has_cursor_off = '[cursor: off]' in current_seg_text
                             
                             # 找出当前时间段活跃的激光点
                             active_points = []
                             current_seg_start = seg.get("start_time", 0)
                             current_seg_end = seg.get("end_time", current_seg_start + seg.get("duration", 0))
                             print(f"段落{seg_idx}: 时间范围 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
-                            for p in laser_points: 
-                                laser_start = p.get('start', 0)
-                                laser_end = p.get('end', laser_start + 1)
-                                if(laser_end > current_seg_start and laser_start < current_seg_end):
-                                    active_points.append(p)
-                                    print(f"激光点活跃: {laser_start:.1f}s - {laser_end:.1f}s 在段落 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
-                                else:
-                                    print(f"激光点不活跃: {laser_start:.1f}s - {laser_end:.1f}s 不在段落 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
+                            print(f"段落文本: '{current_seg_text}'")
+                            print(f"包含激光点开启: {has_cursor_on}, 包含激光点关闭: {has_cursor_off}")
+                            
+                            # 强制显示逻辑：如果段落包含激光点指令，就显示该段落对应的激光点
+                            if has_cursor_on:
+                                # 如果当前段落包含激光点开启指令，显示所有激光点
+                                print(f"段落{seg_idx}包含激光点开启指令，强制显示所有激光点")
+                                active_points = all_laser_points.copy()  # 显示所有激光点
+                            elif '[cursor:' in current_seg_text:
+                                # 如果段落包含任何cursor指令，也显示激光点
+                                print(f"段落{seg_idx}包含cursor指令，显示激光点")
+                                active_points = all_laser_points.copy()
+                            else:
+                                print(f"段落{seg_idx}不包含激光点指令，跳过激光点显示")
                             
                             for p in active_points:
                                 try:
@@ -484,29 +496,44 @@ class PPTSyncedConverter:
                                     y = max(radius, min(height - radius, int(p['y'])))
 
                                     print(f"正在绘制激光点：坐标({x}, {y}), 半径 = {radius}")
+                                    print(f"激光点颜色: {Config.LASER_COLOR}, 光晕颜色: {Config.GLOW_COLOR}")
                                         
-                                    # 绘制光晕效果
+                                    # 绘制光晕效果（更大更明显）
+                                    glow_radius = radius + 15
                                     draw.ellipse(
                                         [
-                                            max(0, x - radius - 10),
-                                            max(0, y - radius - 10),
-                                            min(width - 1, x + radius + 10),
-                                            min(height - 1, y + radius + 10)
+                                            max(0, x - glow_radius),
+                                            max(0, y - glow_radius),
+                                            min(width - 1, x + glow_radius),
+                                            min(height - 1, y + glow_radius)
                                         ],
-                                        fill=Config.GLOW_COLOR
+                                        fill=(255, 100, 100, 150)  # 更明显的半透明红色光晕
                                     )
                                         
-                                    # 绘制激光点核心
+                                    # 绘制激光点核心（更大更明显）
+                                    core_radius = max(8, radius)  # 确保至少8像素半径
                                     draw.ellipse(
                                         [
-                                            max(0, x - radius),
-                                            max(0, y - radius),
-                                            min(width - 1, x + radius),
-                                            min(height - 1, y + radius)
+                                            max(0, x - core_radius),
+                                            max(0, y - core_radius),
+                                            min(width - 1, x + core_radius),
+                                            min(height - 1, y + core_radius)
                                         ],
-                                        fill=Config.LASER_COLOR
+                                        fill=(255, 0, 0, 255)  # 完全不透明的红色核心
                                     )
-                                    print(f"激光点绘制完成")
+                                    
+                                    # 添加白色高亮中心点（更明显）
+                                    center_radius = max(3, core_radius // 3)
+                                    draw.ellipse(
+                                        [
+                                            x - center_radius,
+                                            y - center_radius,
+                                            x + center_radius,
+                                            y + center_radius
+                                        ],
+                                        fill=(255, 255, 255, 255)  # 白色中心高亮
+                                    )
+                                    print(f"激光点绘制完成：光晕半径={glow_radius}, 核心半径={core_radius}, 中心半径={center_radius}")
                                 except Exception as e:
                                     print(f"激光点绘制失败: {str(e)}")
                                     continue
