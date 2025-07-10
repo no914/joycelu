@@ -7,6 +7,7 @@ from typing import List, Dict
 import numpy as np
 from moviepy.editor import *
 from moviepy.video.fx.all import speedx
+from moviepy.audio.io.AudioFileClip import AudioFileClip
 from gtts import gTTS
 from pptx import Presentation
 import comtypes.client
@@ -398,15 +399,19 @@ class PPTSyncedConverter:
                     })
                     current_time += fallback_duration
 
-            # ==================== 5. 生成视频片段 ====================
+            # ==================== 5. 生成视频片段和精确激光点时间 ====================
             all_laser_points = []
             print(f"原始备注文本: {notes_text}")
             print(f"分割后的段落: {segments}")
+            
             for segment in segment_data:
-                segment_laser_points = self.parse_laser_actions(
-                    text=segment["text"],  # 统一使用segment
+                # 使用新的精确时间解析方法
+                segment_laser_points = self.parse_laser_actions_precise(
+                    text=segment["text"],
                     segment_start=segment["start_time"],
-                    segment_duration=segment["duration"],
+                    actual_audio_duration=segment["duration"],
+                    lang=lang,
+                    speed=speed,
                     slide_width=width,
                     slide_height=height
                 )
@@ -421,199 +426,46 @@ class PPTSyncedConverter:
                 print(f"背景图片处理失败: {str(e)}")
                 bg_img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
 
-            for seg_idx, seg in enumerate(segment_data):
-                try:
-                    if not seg or "duration" not in seg or seg['duration'] <= 0:
-                        print(f"跳过无效的段落{seg_idx}")
-                        continue
-                    seg['duration'] = min(15.0, max(0.5, seg['duration']))    
-
-                    # 创建透明覆盖层
-                    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                    draw = ImageDraw.Draw(overlay)
-
-                    # ==================== 6. 安全生成字幕 ====================
-                    if seg.get("clean_text"):
-                        try:
-                            # 生成安全字幕图像
-                            subtitle_img = self._generate_safe_subtitle(
-                                text=seg["clean_text"],
-                                bg_img=bg_img,
-                                max_width=width,
-                                max_height=height
+                            # ==================== 6. 创建动态激光点视频 ====================
+                # 使用动态帧生成来实现精确的激光点时间控制
+                total_duration = sum(seg.get("duration", 0) for seg in segment_data)
+                
+                if total_duration > 0:
+                    try:
+                        # 创建动态视频剪辑
+                        def make_frame(t):
+                            return self._generate_frame_with_precise_laser(
+                                bg_img, t, segment_data, all_laser_points, width, height
                             )
-                            
-                            if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
-                                # 计算安全位置（带边界检查）
-                                y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
-                                y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
-                                
-                                x_pos = (width - subtitle_img.width) // 2
-                                x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
-                                
-                                # 合并字幕到覆盖层
-                                overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
-                        except Exception as e:
-                            print(f"字幕生成失败: {str(e)}")
-
-                    # ==================== 7. 绘制激光笔动画 ====================
-                    if all_laser_points:
-                        try:
-                            radius = int(height * Config.LASER_RADIUS_RATIO)
-                            
-                            # 检查当前段落文本是否包含激光点指令
-                            current_seg_text = seg.get("text", "")
-                            has_cursor_on = '[cursor:' in current_seg_text and '[cursor: off]' not in current_seg_text
-                            has_cursor_off = '[cursor: off]' in current_seg_text
-                            
-                            # 找出当前时间段活跃的激光点
-                            active_points = []
-                            current_seg_start = seg.get("start_time", 0)
-                            current_seg_end = seg.get("end_time", current_seg_start + seg.get("duration", 0))
-                            print(f"段落{seg_idx}: 时间范围 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
-                            print(f"段落文本: '{current_seg_text}'")
-                            print(f"包含激光点开启: {has_cursor_on}, 包含激光点关闭: {has_cursor_off}")
-                            
-                            # 强制显示逻辑：如果段落包含激光点指令，就显示该段落对应的激光点
-                            if has_cursor_on:
-                                # 如果当前段落包含激光点开启指令，显示所有激光点
-                                print(f"段落{seg_idx}包含激光点开启指令，强制显示所有激光点")
-                                active_points = all_laser_points.copy()  # 显示所有激光点
-                            elif '[cursor:' in current_seg_text:
-                                # 如果段落包含任何cursor指令，也显示激光点
-                                print(f"段落{seg_idx}包含cursor指令，显示激光点")
-                                active_points = all_laser_points.copy()
-                            else:
-                                print(f"段落{seg_idx}不包含激光点指令，跳过激光点显示")
-                            
-                            for p in active_points:
-                                try:
-                                    if 'x' not in p or 'y' not in p:
-                                        continue
-
-                                    # 安全坐标检查
-                                    x = max(radius, min(width - radius, int(p['x'])))
-                                    y = max(radius, min(height - radius, int(p['y'])))
-
-                                    print(f"正在绘制激光点：坐标({x}, {y}), 半径 = {radius}")
-                                    print(f"激光点颜色: {Config.LASER_COLOR}, 光晕颜色: {Config.GLOW_COLOR}")
-                                        
-                                    # 绘制光晕效果（更大更明显）
-                                    glow_radius = radius + 15
-                                    draw.ellipse(
-                                        [
-                                            max(0, x - glow_radius),
-                                            max(0, y - glow_radius),
-                                            min(width - 1, x + glow_radius),
-                                            min(height - 1, y + glow_radius)
-                                        ],
-                                        fill=(255, 100, 100, 150)  # 更明显的半透明红色光晕
-                                    )
-                                        
-                                    # 绘制激光点核心（更大更明显）
-                                    core_radius = max(8, radius)  # 确保至少8像素半径
-                                    draw.ellipse(
-                                        [
-                                            max(0, x - core_radius),
-                                            max(0, y - core_radius),
-                                            min(width - 1, x + core_radius),
-                                            min(height - 1, y + core_radius)
-                                        ],
-                                        fill=(255, 0, 0, 255)  # 完全不透明的红色核心
-                                    )
-                                    
-                                    # 添加白色高亮中心点（更明显）
-                                    center_radius = max(3, core_radius // 3)
-                                    draw.ellipse(
-                                        [
-                                            x - center_radius,
-                                            y - center_radius,
-                                            x + center_radius,
-                                            y + center_radius
-                                        ],
-                                        fill=(255, 255, 255, 255)  # 白色中心高亮
-                                    )
-                                    print(f"激光点绘制完成：光晕半径={glow_radius}, 核心半径={core_radius}, 中心半径={center_radius}")
-                                except Exception as e:
-                                    print(f"激光点绘制失败: {str(e)}")
-                                    continue
-                        except Exception as e:
-                            print(f"激光点处理失败: {str(e)}")
-
-                    # ==================== 8. 合并图层 ====================
-                    try:
-                        final_img = Image.alpha_composite(bg_img, overlay)
-                    except Exception as e:
-                        print(f"图层合并失败: {str(e)}")
-                        final_img = bg_img
-                    
-                    # 确保图像数组格式正确
-                    try:
-                        img_array = np.array(final_img)
-                        if img_array.ndim != 3 or img_array.shape[2] not in [3, 4]:
-                            img_array = np.zeros((height, width, 3), dtype = np.uint8)
-                            img_array.fill(255)
-                        elif img_array.shape[2] == 4:
-                            img_array = img_array[:, :, :3]
-                    except Exception as e:
-                        print(f"图像数组转换失败: {str(e)}")
-                        img_array = np.full((height, width, 3), 255, dtype = np.uint8)
-
-                    # ==================== 9. 创建视频片段 ====================
-                    try:
-                        final_clip = ImageClip(img_array).set_duration(seg["duration"])
-
-                        has_valid_audio = False
-                        if seg.get("audio") and hasattr(seg["audio"], 'duration'):
-                            try:
-                                audio_duration = seg["audio"].duration
-                                if audio_duration > 0 and abs(audio_duration - seg["duration"]) < 2.0: 
-                                    final_clip = final_clip.set_audio(seg["audio"])
-                            except Exception as e:
-                                print(f"音频添加失败: {str(e)}")
                         
-                        # 保存临时文件
-                        temp_path = os.path.join(temp_dir, f"seg_{index}_{seg_idx}.mp4")
-                        final_clip.write_videofile(
-                            temp_path,
-                            fps=15,
-                            codec='libx264',
-                            audio_codec='aac',
-                            preset='ultrafast',
-                            threads=1,
-                            ffmpeg_params=['-pix_fmt', 'yuva420p', '-max_muxing_queue_size', '1024', '-avoid_negative_ts', 'make_zero'],
-                            logger=None,
-                            verbose = False
-                        )
-                        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
-                            video_clips.append(temp_path)
-                        else:
-                            print(f"生成的视频文件无效: {temp_path}")
-
-                        final_clip.close()
-                        if seg.get("audio"):
+                        # 创建视频剪辑
+                        video_clip = VideoClip(make_frame, duration=total_duration)
+                        
+                        # 添加音频
+                        audio_clips = []
+                        for seg in segment_data:
+                            if seg.get("audio") and hasattr(seg["audio"], 'duration'):
+                                try:
+                                    audio_clips.append(seg["audio"])
+                                except Exception as e:
+                                    print(f"音频处理失败: {str(e)}")
+                        
+                        if audio_clips:
                             try:
-                                seg["audio"].close()
-                            except:
-                                pass
+                                combined_audio = concatenate_audioclips(audio_clips)
+                                video_clip = video_clip.set_audio(combined_audio)
+                            except Exception as e:
+                                print(f"音频合并失败: {str(e)}")
+                        
+                        return video_clip
+                        
                     except Exception as e:
-                        print(f"视频片段创建失败: {str(e)}")
-                        continue
-                    
-                except Exception as e:
-                    print(f"创建幻灯片片段时出错: {str(e)}")
-                    continue
-
-            # ==================== 10. 合并所有片段 ====================
-            if video_clips:
-                try:
-                    loaded_clips = [VideoFileClip(v) for v in video_clips]
-                    return concatenate_videoclips(loaded_clips)
-                except Exception as e:
-                    print(f"合并片段失败: {str(e)}")
-            
-            # ==================== 11. 回退方案 ====================
-            return self._create_fallback_clip(img_path, temp_dir, index)
+                        print(f"动态视频生成失败: {str(e)}")
+                        # 回退到静态方法
+                        return self._create_static_video_segments(segment_data, bg_img, all_laser_points, temp_dir, index, width, height)
+                
+                # 如果没有有效的段落数据，返回空
+                return self._create_fallback_clip(img_path, temp_dir, index)
 
         except Exception as e:
             print(f"创建幻灯片时出错: {str(e)}")
@@ -692,14 +544,19 @@ class PPTSyncedConverter:
     def _create_fallback_clip(self, img_path, temp_dir, index):
         """创建后备视频片段（当主流程失败时使用）"""
         try:
-            bg_img = Image.open(img_path).convert('RGB')
-            bg_clip = ImageClip(np.array(bg_img)).set_duration(3.0)
-            temp_path = os.path.join(temp_dir, f"seg_{index}_fallback.mp4")
-            bg_clip.write_videofile(temp_path, fps=15)
-            return VideoFileClip(temp_path)
+            if img_path and os.path.exists(img_path):
+                bg_img = Image.open(img_path).convert('RGB')
+                bg_clip = ImageClip(np.array(bg_img)).set_duration(3.0)
+                temp_path = os.path.join(temp_dir, f"seg_{index}_fallback.mp4")
+                bg_clip.write_videofile(temp_path, fps=15, verbose=False)
+                return VideoFileClip(temp_path)
+            else:
+                # 如果没有图片路径，创建空白背景
+                blank = np.full((480, 854, 3), 255, dtype=np.uint8)  # 白色背景
+                return ImageClip(blank).set_duration(3.0)
         except:
             # 终极后备方案
-            blank = np.zeros((100, 100, 3), dtype=np.uint8)
+            blank = np.full((480, 854, 3), 128, dtype=np.uint8)  # 灰色背景
             return ImageClip(blank).set_duration(3.0)
 
     def _split_text_segments(self, text):
@@ -795,34 +652,50 @@ class PPTSyncedConverter:
                 continue
         return adjusted_points
         
-    def parse_laser_actions(self, text, segment_start, segment_duration, slide_width=1920, slide_height=1080):
-        """改进版激光点解析"""
+    def parse_laser_actions_precise(self, text, segment_start, actual_audio_duration, lang='zh-cn', speed=1.0, slide_width=1920, slide_height=1080):
+        """精确的激光点时间解析 - 基于实际语音时长"""
         cursor_positions = []
         
-        # 更健壮的正则表达式，匹配所有光标指令
+        # 正则表达式匹配激光点指令
         cursor_pattern = re.compile(
             r'\[cursor:\s*(\d+)\s*,\s*(\d+)\]|\[cursor:\s*off\]',
             re.IGNORECASE
         )
         
-        # 按字符位置计算时间
-        text_length = len(text)
-        if text_length == 0:
+        # 移除激光点指令，获取纯文本用于时间计算
+        clean_text = re.sub(cursor_pattern, '', text)
+        
+        if not clean_text.strip():
             return []
         
-        char_duration = segment_duration / text_length
+        # 计算每个字符的时间位置（基于实际音频时长）
+        char_timings = self._calculate_char_timings(clean_text, actual_audio_duration, lang, speed)
         
+        # 解析激光点指令
         for match in cursor_pattern.finditer(text):
             cursor_cmd = match.group()
-            pos_in_text = match.start()
             
-            # 计算激光点出现时间
-            appear_time = segment_start + pos_in_text * char_duration
+            # 计算指令前的文本长度（不包括之前的指令）
+            text_before_cursor = text[:match.start()]
+            clean_text_before = re.sub(cursor_pattern, '', text_before_cursor)
+            char_count_before = len(clean_text_before.strip())
+            
+            # 计算激光点出现的精确时间
+            if char_count_before > 0:
+                # 基于前面文本的字符数量计算时间
+                appear_time = segment_start + char_timings.get(char_count_before - 1, actual_audio_duration)
+            else:
+                appear_time = segment_start
+            
+            print(f"激光点指令: {cursor_cmd}")
+            print(f"指令前文本: '{clean_text_before}' (长度: {char_count_before})")
+            print(f"计算出现时间: {appear_time:.2f}s (段落开始: {segment_start:.2f}s)")
             
             if 'off' in cursor_cmd.lower():
                 # 关闭激光点
                 if cursor_positions:
                     cursor_positions[-1]['end'] = appear_time
+                    print(f"激光点关闭时间: {appear_time:.2f}s")
             else:
                 # 解析坐标
                 coords = [int(g) for g in match.groups() if g]
@@ -830,15 +703,242 @@ class PPTSyncedConverter:
                     x = int(slide_width * coords[0] / 100)
                     y = int(slide_height * coords[1] / 100)
                     
-                    # 添加新激光点（默认持续到段落结束）
-                    cursor_positions.append({
+                    # 添加新激光点
+                    laser_point = {
                         'x': x,
                         'y': y,
                         'start': appear_time,
-                        'end': segment_start + segment_duration  # 默认持续到段落结束
-                    })
+                        'end': segment_start + actual_audio_duration  # 默认持续到段落结束
+                    }
+                    cursor_positions.append(laser_point)
+                    print(f"新激光点: 坐标({x}, {y}), 开始时间: {appear_time:.2f}s")
         
         return cursor_positions
+    
+    def _calculate_char_timings(self, text, total_duration, lang='zh-cn', speed=1.0):
+        """计算每个字符的时间位置"""
+        char_timings = {}
+        
+        if not text.strip():
+            return char_timings
+        
+        # 根据语言调整计算方式
+        if lang and lang.startswith('zh'):
+            # 中文：按字符计算
+            chars = [c for c in text if c.strip()]  # 去掉空白字符
+            if not chars:
+                return char_timings
+                
+            # 平均每个字符的时间
+            char_duration = total_duration / len(chars)
+            
+            current_time = 0.0
+            char_index = 0
+            
+            for i, char in enumerate(text):
+                if char.strip():  # 非空白字符
+                    char_timings[char_index] = current_time
+                    current_time += char_duration
+                    char_index += 1
+                # 空白字符不计入时间，但会略微增加间隔
+                elif char_index > 0:
+                    current_time += char_duration * 0.1
+                    
+        else:
+            # 英文：按单词计算
+            words = text.split()
+            if not words:
+                return char_timings
+                
+            word_duration = total_duration / len(words)
+            current_time = 0.0
+            char_position = 0
+            
+            for word in words:
+                # 为单词中的每个字符分配时间
+                word_char_duration = word_duration / len(word) if word else 0
+                for char in word:
+                    char_timings[char_position] = current_time
+                    current_time += word_char_duration
+                    char_position += 1
+                
+                # 单词间隔
+                current_time += word_duration * 0.1
+                # 处理单词后的空格
+                char_position += 1
+        
+        return char_timings
+    
+    def _generate_frame_with_precise_laser(self, bg_img, t, segment_data, all_laser_points, width, height):
+        """根据时间t生成包含精确激光点的帧"""
+        try:
+            # 创建背景图像副本
+            frame_img = bg_img.copy()
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            
+            # 找到当前时间对应的段落和字幕
+            current_segment = None
+            for seg in segment_data:
+                seg_start = seg.get("start_time", 0)
+                seg_end = seg_start + seg.get("duration", 0)
+                if seg_start <= t < seg_end:
+                    current_segment = seg
+                    break
+            
+            # 绘制字幕
+            if current_segment and current_segment.get("clean_text"):
+                try:
+                    subtitle_img = self._generate_safe_subtitle(
+                        text=current_segment["clean_text"],
+                        bg_img=frame_img,
+                        max_width=width,
+                        max_height=height
+                    )
+                    
+                    if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
+                        y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
+                        y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
+                        x_pos = (width - subtitle_img.width) // 2
+                        x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
+                        overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+                except Exception as e:
+                    print(f"帧{t:.2f}s字幕生成失败: {str(e)}")
+            
+            # 绘制激光点（基于精确时间）
+            active_laser_points = self.get_active_laser_points(all_laser_points, t)
+            if active_laser_points:
+                radius = int(height * Config.LASER_RADIUS_RATIO)
+                
+                for point in active_laser_points:
+                    try:
+                        x = max(radius, min(width - radius, int(point['x'])))
+                        y = max(radius, min(height - radius, int(point['y'])))
+                        
+                        # 绘制光晕效果
+                        glow_radius = radius + 15
+                        draw.ellipse(
+                            [
+                                max(0, x - glow_radius),
+                                max(0, y - glow_radius),
+                                min(width - 1, x + glow_radius),
+                                min(height - 1, y + glow_radius)
+                            ],
+                            fill=(255, 100, 100, 150)
+                        )
+                        
+                        # 绘制激光点核心
+                        core_radius = max(8, radius)
+                        draw.ellipse(
+                            [
+                                max(0, x - core_radius),
+                                max(0, y - core_radius),
+                                min(width - 1, x + core_radius),
+                                min(height - 1, y + core_radius)
+                            ],
+                            fill=(255, 0, 0, 255)
+                        )
+                        
+                        # 添加白色中心点
+                        center_radius = max(3, core_radius // 3)
+                        draw.ellipse(
+                            [
+                                x - center_radius,
+                                y - center_radius,
+                                x + center_radius,
+                                y + center_radius
+                            ],
+                            fill=(255, 255, 255, 255)
+                        )
+                        
+                        if t % 2 < 0.1:  # 每2秒打印一次，避免日志过多
+                            print(f"时间{t:.2f}s: 激光点活跃 坐标({x}, {y})")
+                            
+                    except Exception as e:
+                        print(f"绘制激光点失败: {str(e)}")
+            
+            # 合并图层
+            final_img = Image.alpha_composite(frame_img, overlay)
+            
+            # 转换为numpy数组
+            img_array = np.array(final_img)
+            if img_array.shape[2] == 4:  # RGBA转RGB
+                img_array = img_array[:, :, :3]
+            
+            return img_array
+            
+        except Exception as e:
+            print(f"生成帧失败(t={t:.2f}s): {str(e)}")
+            # 返回纯背景
+            bg_array = np.array(bg_img)
+            if bg_array.shape[2] == 4:
+                bg_array = bg_array[:, :, :3]
+            return bg_array
+    
+    def _create_static_video_segments(self, segment_data, bg_img, all_laser_points, temp_dir, index, width, height):
+        """静态视频片段生成方法（回退方案）"""
+        try:
+            video_clips = []
+            
+            for seg_idx, seg in enumerate(segment_data):
+                try:
+                    if not seg or "duration" not in seg or seg['duration'] <= 0:
+                        continue
+                        
+                    # 创建静态帧
+                    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                    draw = ImageDraw.Draw(overlay)
+                    
+                    # 添加字幕
+                    if seg.get("clean_text"):
+                        try:
+                            subtitle_img = self._generate_safe_subtitle(
+                                text=seg["clean_text"],
+                                bg_img=bg_img,
+                                max_width=width,
+                                max_height=height
+                            )
+                            if subtitle_img:
+                                y_pos = int(height * self.subtitle_style['position_y'] - subtitle_img.height // 2)
+                                y_pos = max(10, min(height - subtitle_img.height - 10, y_pos))
+                                x_pos = (width - subtitle_img.width) // 2
+                                x_pos = max(10, min(width - subtitle_img.width - 10, x_pos))
+                                overlay.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+                        except:
+                            pass
+                    
+                    # 合并图层
+                    final_img = Image.alpha_composite(bg_img, overlay)
+                    img_array = np.array(final_img)
+                    if img_array.shape[2] == 4:
+                        img_array = img_array[:, :, :3]
+                    
+                    # 创建视频片段
+                    clip = ImageClip(img_array).set_duration(seg["duration"])
+                    if seg.get("audio"):
+                        clip = clip.set_audio(seg["audio"])
+                    
+                    # 保存临时文件
+                    temp_path = os.path.join(temp_dir, f"static_seg_{index}_{seg_idx}.mp4")
+                    clip.write_videofile(temp_path, fps=15, verbose=False)
+                    
+                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
+                        video_clips.append(VideoFileClip(temp_path))
+                    
+                    clip.close()
+                    
+                except Exception as e:
+                    print(f"静态段落{seg_idx}创建失败: {str(e)}")
+                    continue
+            
+            if video_clips:
+                return concatenate_videoclips(video_clips)
+            else:
+                return self._create_fallback_clip("", temp_dir, index)
+                
+        except Exception as e:
+            print(f"静态视频生成失败: {str(e)}")
+            return self._create_fallback_clip("", temp_dir, index)
         
     def get_active_laser_points(self, laser_points, current_time):
         active_points = []
