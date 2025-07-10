@@ -61,60 +61,6 @@ class PPTSyncedConverter:
         self._active_resources = []
         self.prs = None
         self._lock_files = set()
-        self._check_dependencies()
-        self._patch_moviepy_compatibility()
-    
-    def _patch_moviepy_compatibility(self):
-        """修补moviepy兼容性问题"""
-        try:
-            from moviepy.audio.io.AudioFileClip import AudioFileClip
-            from moviepy.video.io.VideoFileClip import VideoFileClip
-            
-            # 修补AudioFileClip
-            def safe_close(self):
-                if hasattr(self, 'reader') and self.reader:
-                    try:
-                        if hasattr(self.reader, 'close_proc'):
-                            self.reader.close_proc()
-                        if hasattr(self.reader, 'proc') and self.reader.proc:
-                            self.reader.proc.terminate()
-                    except:
-                        pass
-                if hasattr(self, 'close'):
-                    super(AudioFileClip, self).close()
-                    
-            AudioFileClip.close = safe_close
-            
-            # 修补VideoFileClip
-            def safe_write(self, *args, **kwargs):
-                kwargs.update({
-                    'ffmpeg_params': [
-                        '-max_muxing_queue_size', '1024',
-                        '-threads', '1'
-                    ],
-                    'preset': 'ultrafast',
-                    'audio_codec': 'aac',
-                    'temp_audiofile': 'temp_audio.mp3'
-                })
-                return super(VideoFileClip, self).write_videofile(*args, **kwargs)
-                
-            VideoFileClip.write_videofile = safe_write
-            
-        except Exception as e:
-            print(f"兼容性修补失败: {str(e)}")
-        
-    def _check_dependencies(self):
-        """检查依赖库版本"""
-        import moviepy
-        from pkg_resources import parse_version
-        
-        if parse_version(moviepy.__version__) < parse_version('1.0.0'):
-            print("警告: moviepy版本过低，建议升级到1.0.0+")
-            print("执行: pip install --upgrade moviepy")
-
-    def _register_temp_file(self, path):
-        """注册临时文件以便后续清理"""
-        self._lock_files.add(os.path.abspath(path))
 
     def _cleanup_temp_files(self):
         """More robust temp file cleanup"""
@@ -164,13 +110,6 @@ class PPTSyncedConverter:
             gc.collect()
         except:
             pass
-
-    def __del__(self):
-        """安全的析构函数"""
-        try:
-            self._cleanup_resources()
-        except:
-            pass  # 避免在解释器关闭时抛出异常
 
     def _ensure_path(self, path):
         """确保目录存在且路径有效"""
@@ -244,24 +183,6 @@ class PPTSyncedConverter:
                 deck.Close()
                 powerpoint.Quit()
                 comtypes.CoUninitialize()
-
-    def ensure_rgba(self, image_array):
-        """Ensure image is RGBA with proper dimensions"""
-        try:
-            if image_array is None:
-                return np.zeros((100, 100, 4), dtype=np.uint8)
-                
-            if len(image_array.shape) == 2:  # Grayscale
-                return np.dstack([image_array]*3 + [np.ones(image_array.shape, dtype=np.uint8)*255])
-            elif image_array.shape[2] == 3:  # RGB
-                return np.dstack((image_array, np.ones(image_array.shape[:2], dtype=np.uint8)*255))
-            elif image_array.shape[2] == 4:  # RGBA
-                return image_array
-            else:
-                return np.zeros((100, 100, 4), dtype=np.uint8)
-        except Exception as e:
-            print(f"Image conversion error: {str(e)}")
-            return np.zeros((100, 100, 4), dtype=np.uint8)
 
     def is_english(self, text):
         return all(ord(c) < 128 for c in text)
@@ -479,16 +400,18 @@ class PPTSyncedConverter:
 
             # ==================== 5. 生成视频片段 ====================
             laser_points = []
-            if segment_data:
-                laser_points = self.parse_laser_actions_from_segments(segment_data, width, height, lang, speed)
+            print(f"原始备注文本: {notes_text}")
+            print(f"分割后的段落: {segments}")
+            for segment in segment_data:
+                laser_points = self.parse_laser_actions(
+                    text=segment["text"],  # 统一使用segment
+                    segment_start=segment["start_time"],
+                    segment_duration=segment["duration"],
+                    slide_width=width,
+                    slide_height=height
+                )
                 print(f"基于段落解析的激光点: {laser_points}")
-            if False and laser_points and segment_data:
-                actual_total_duration = max(seg.get("end_time", 0) for seg in segment_data)
-                if actual_total_duration > 0:
-                    adjusted_laser_points = self.adjust_laser_timing(laser_points, actual_total_duration)
-                    laser_points = adjusted_laser_points
-                    print(f"激光时间已调整到实际音频时长：{actual_total_duration:.1f}秒")
-                    print(f"调整后的激光点：{laser_points}")
+
             try:
                 bg_img = Image.open(img_path).convert('RGBA')
                 if bg_img.size != (width, height):
@@ -540,11 +463,11 @@ class PPTSyncedConverter:
                             # 找出当前时间段活跃的激光点
                             active_points = []
                             current_seg_start = seg.get("start_time", 0)
-                            current_seg_end = seg.get("end_time", seg.get("duration", 0))
+                            current_seg_end = seg.get("end_time", current_seg_start + seg.get("duration", 0))
                             print(f"段落{seg_idx}: 时间范围 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
                             for p in laser_points: 
                                 laser_start = p.get('start', 0)
-                                laser_end = p.get('end', 0)
+                                laser_end = p.get('end', laser_start + 1)
                                 if(laser_end > current_seg_start and laser_start < current_seg_end):
                                     active_points.append(p)
                                     print(f"激光点活跃: {laser_start:.1f}s - {laser_end:.1f}s 在段落 {current_seg_start:.1f}s - {current_seg_end:.1f}s")
@@ -739,57 +662,6 @@ class PPTSyncedConverter:
             draw.text((15,10), "Subtitle Error", fill=(255, 255, 255, 255))
             return error_overlay
 
-    def _split_text_lines(self, text, max_chars, max_pixel_width):
-        """将文本分割为适合显示的行"""
-        lines = []
-        
-        if self.is_english(text):
-            words = text.split()
-            current_line = ""
-            for word in words:
-                if len(current_line + " " + word) <= max_chars:
-                    current_line += (" " + word if current_line else word)
-                else:
-                    lines.append(current_line)
-                    current_line = word
-            if current_line:
-                lines.append(current_line)
-        else:  # 中文处理
-            current_line = ""
-            for char in text:
-                if len(current_line + char) <= max_chars:
-                    current_line += char
-                else:
-                    lines.append(current_line)
-                    current_line = char
-            if current_line:
-                lines.append(current_line)
-        
-        return lines
-
-    def _calculate_optimal_font_size(self, lines, max_width, max_height):
-        """动态计算最佳字体大小"""
-        max_font = int(max_height * 0.05)
-        min_font = 12
-        
-        for size in range(max_font, min_font, -1):
-            try:
-                font = ImageFont.truetype("simhei.ttf", size)
-            except:
-                font = ImageFont.load_default(size=size)
-            
-            # 检查所有行是否适应
-            fits = True
-            for line in lines:
-                if font.getbbox(line)[2] > max_width * 0.9:
-                    fits = False
-                    break
-                    
-            if fits and (len(lines) * (font.getbbox("A")[3] + 5)) < max_height * 0.3:
-                return size
-        
-        return min_font
-
     def _create_fallback_clip(self, img_path, temp_dir, index):
         """创建后备视频片段（当主流程失败时使用）"""
         try:
@@ -802,8 +674,6 @@ class PPTSyncedConverter:
             # 终极后备方案
             blank = np.zeros((100, 100, 3), dtype=np.uint8)
             return ImageClip(blank).set_duration(3.0)
-        
-    
 
     def _split_text_segments(self, text):
         """辅助方法：分割文本为语音段落"""
@@ -876,163 +746,79 @@ class PPTSyncedConverter:
                 current_time += word_duration + 0.1
         return word_timings
 
-    def create_laser_animation(self, slide_path, points, resolution):
-        try:
-            width, height = resolution
-            radius = int(height * Config.LASER_RADIUS_RATIO)
-            
-            # 创建调试目录
-            debug_dir = os.path.abspath("laser_debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            
-            def make_frame(t):
-                # 创建透明图层
-                img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(img)
-                
-                # 找出当前时间点活跃的激光点
-                active_points = [p for p in points if p['start'] <= t <= p['end']]
-                
-                for p in active_points:
-                    x, y = int(p['x']), int(p['y'])
-                    print(f"在位置 ({x}, {y}) 绘制激光点")  # 调试输出
-                    
-                    # 绘制光晕效果
-                    draw.ellipse(
-                        [x-radius-10, y-radius-10, x+radius+10, y+radius+10],
-                        fill=Config.GLOW_COLOR
-                    )
-                    
-                    # 绘制激光点核心
-                    draw.ellipse(
-                        [x-radius, y-radius, x+radius, y+radius],
-                        fill=Config.LASER_COLOR
-                    )
-                
-                # 保存调试图片
-                debug_path = os.path.join(debug_dir, f"laser_{int(t*100)}.png")
-                img.save(debug_path)
-                
-                return np.array(img)
-            
-            duration = max(p['end'] for p in points) if points else 1.0
-            return VideoClip(make_frame, duration=duration)
-        
-        except Exception as e:
-            print(f"激光动画创建失败: {str(e)}")
-            return None
-
     def adjust_laser_timing(self, points, new_duration):
-        if not points:
+        if not points or new_duration <= 0:
             return points
         
-        original_duration = points[-1]["end"]
+        original_duration = max(p['end'] for p in points) if points else 0
         if original_duration <= 0:
             return points
         
         ratio = new_duration / original_duration
-        return [
-            {
-                "x": p["x"],
-                "y": p["y"],
-                "start": p["start"] * ratio,
-                "end": p["end"] * ratio
-            }
-            for p in points
-        ]
+        adjusted_points = []
+        for p in points:
+            try:
+                adjusted_points.append({
+                    "x": p["x"],
+                    "y": p["y"],
+                    "start": p["start"] * ratio,
+                    "end": p["end"] * ratio
+                })
+            except:
+                continue
+        return adjusted_points
         
-    def split_text_for_speech(self, text, lang):
-        if lang.startswith('zh'):
-            sentences = re.split('([，。！？])', text)
-            return [s for s in [''.join(x) for x in zip(sentences[::2], sentences[1::2])] if s.strip()]
-        else:
-            return [s.strip() for s in re.split(r'[.!?]', text) if s.strip()]
+    def parse_laser_actions(self, text, segment_start, segment_duration, slide_width=1920, slide_height=1080):
+        """改进版激光点解析"""
+        cursor_positions = []
         
-    def parse_laser_actions_from_segments(self, segment_data: List[Dict], 
-                        slide_width: int = 1920, slide_height: int = 1080,
-                        lang: str = 'zh-cn', speed: float = 1.0) -> List[Dict]:
-        """解析激光笔指令并计算精确时间位置（带完整边界检查）"""
-        laser_points = []
-        try:
-            for seg_idx, segment in enumerate(segment_data):
-                segment_text = segment.get("text", "")
-                segment_start = segment.get("start_time", 0)
-                segment_duration = segment.get("duration", 0)
-                segment_end = segment_start + segment_duration
-
-                if not segment_text.strip():
-                    continue
-                print(f"分析段落{seg_idx}: '{segment_text}' (时间： {segment_start:.1f}s - {segment_end:.1f}s)")
-
-                cursor_pattern =  re.compile(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]')
-                matches = list(cursor_pattern.finditer(segment_text))
-                if not matches:
-                    continue
-
-                word_timings = self.calculate_word_timing(segment_text, lang, speed)
-                adjusted_word_timing = {}
-                for i, timing in word_timings.items():
-                    adjusted_word_timing[i] = {
-                        'word': timing['word'],
-                        'start': timing['start'] + segment_start,
-                        'end': timing['end'] + segment_start
-                    }
-                current_laser = None
-
-                for match in matches:
-                    cursor_cmd = match.group()
-                    cursor_pos = match.start()
-
-                    text_before = segment_text[:cursor_pos]
-                    clean_text_before = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text_before)
-
-                    if 'off' in cursor_cmd.lower():
-                        if current_laser:
-                            end_time = self._find_word_end_time(clean_text_before, adjusted_word_timing, lang)
-                            if end_time == 0:
-                                relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
-                                end_time = segment_start + (segment_duration * relative_pos)
-                            
-                            current_laser['end'] = min(segment_end, end_time)
-                            laser_points.append(current_laser)
-                            print(f"激光点结束: {current_laser['start']:.1f}s - {current_laser['end']:.1f}s")
-                            current_laser = None
-                    else:   
-                        # 解析坐标（带边界检查）
-                        coords = re.findall(r'\d+', cursor_cmd)
-                        if len(coords) >= 2:
-                            try:
-                                # 确保百分比在0-100范围内
-                                x_percent = min(100, max(0, float(coords[0])))
-                                y_percent = min(100, max(0, float(coords[1])))
-                                # 计算实际像素坐标
-                                x = max(0, min(slide_width - 1, int(slide_width * x_percent / 100)))
-                                y = max(0, min(slide_height - 1, int(slide_height * y_percent / 100)))
-
-                                start_time = self._find_word_end_time(clean_text_before, adjusted_word_timing, lang)
-                                if start_time == 0:
-                                    relative_pos = min(1.0, cursor_pos / max(1, len(segment_text)))
-                                    start_time = segment_start + (segment_duration * relative_pos)
-                                    
-                                current_laser = {
-                                    'x': x,
-                                    'y': y,
-                                    'start': max(segment_start, start_time),
-                                    'end': segment_end  # 默认持续到结束
-                                }
-                                print(f"激光点开始： {current_laser['start']:.1f}s 坐标({x}, {y})")
-                            except (ValueError, TypeError) as e:
-                                print(f"坐标解析错误: {str(e)}")
-                                continue
-
-                if current_laser:
-                    current_laser['end'] = segment_end
-                    laser_points.append(current_laser)
-                    print(f"🔧 激光点自动结束在段落末尾: {current_laser['start']:.1f}s - {current_laser['end']:.1f}s")
-            return laser_points
-        except Exception as e:
-            print(f"激光点解析错误: {str(e)}")
+        # 更健壮的正则表达式，匹配所有光标指令
+        cursor_pattern = re.compile(
+            r'\[cursor:\s*(\d+)\s*,\s*(\d+)\]|\[cursor:\s*off\]',
+            re.IGNORECASE
+        )
+        
+        # 按字符位置计算时间
+        text_length = len(text)
+        if text_length == 0:
             return []
+        
+        char_duration = segment_duration / text_length
+        
+        for match in cursor_pattern.finditer(text):
+            cursor_cmd = match.group()
+            pos_in_text = match.start()
+            
+            # 计算激光点出现时间
+            appear_time = segment_start + pos_in_text * char_duration
+            
+            if 'off' in cursor_cmd.lower():
+                # 关闭激光点
+                if cursor_positions:
+                    cursor_positions[-1]['end'] = appear_time
+            else:
+                # 解析坐标
+                coords = [int(g) for g in match.groups() if g]
+                if len(coords) >= 2:
+                    x = int(slide_width * coords[0] / 100)
+                    y = int(slide_height * coords[1] / 100)
+                    
+                    # 添加新激光点（默认持续到段落结束）
+                    cursor_positions.append({
+                        'x': x,
+                        'y': y,
+                        'start': appear_time,
+                        'end': segment_start + segment_duration  # 默认持续到段落结束
+                    })
+        
+        return cursor_positions
+        
+    def get_active_laser_points(self, laser_points, current_time):
+        active_points = []
+        for point in laser_points:
+            if point['start'] <= current_time <= point['end']:
+                active_points.append(point)
+        return active_points
         
     def _find_word_end_time(self, text_before: str, word_timings: Dict, lang: str) -> float:
         if not text_before.strip() or not word_timings:
@@ -1054,32 +840,6 @@ class PPTSyncedConverter:
                         if i in word_timings:
                             return word_timings[i]['end']
         return 0.0
-
-    def make_layers_compatible(self, layers):
-        """确保所有图层通道一致"""
-        compatible_layers = []
-        
-        for layer in layers:
-            if layer is None:
-                continue
-                
-            try:
-                frame = layer.get_frame(0) if hasattr(layer, 'get_frame') else layer.img
-                frame = self.ensure_rgba(frame)
-                
-                # 重建兼容的clip
-                if hasattr(layer, 'get_frame'):
-                    new_clip = VideoClip(lambda t: frame, duration=layer.duration)
-                else:
-                    new_clip = ImageClip(frame)
-                
-                compatible_layers.append(new_clip.set_duration(layer.duration))
-                
-            except Exception as e:
-                print(f"图层转换失败: {str(e)}")
-                continue
-                
-        return compatible_layers
 
     def convert_ppt_to_video(self, pptx_path, output_path, lang='zh-cn', resolution=(854, 480), speed=1.0, fps=15):
         try:
@@ -1215,16 +975,6 @@ class PPTSyncedConverter:
             return False
         finally:
             self._cleanup_resources()
-
-    def _check_system_resources(self):
-        """检查系统资源状态"""
-        mem = psutil.virtual_memory()
-        if mem.percent > 90:
-            self.update_progress(f"系统内存使用率高: {mem.percent}%")
-            gc.collect()
-            time.sleep(5)
-            return False
-        return True
 
 def get_users_choice():
     print("请选择语音语言")
