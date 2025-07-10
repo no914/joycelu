@@ -666,9 +666,9 @@ class PPTSyncedConverter:
         return adjusted_points
         
     def parse_laser_actions_precise(self, text, segment_start, actual_audio_duration, resolution, lang='zh-cn', speed=1.0):
-        """精确的激光点时间解析 - 基于实际语音时长"""
+        """精确的激光点时间解析 - 基于实际语音时长，激光点只在遇到 [cursor: off] 时消失"""
         cursor_positions = []
-        active_laser = None
+        active_lasers = []  # 改为数组，支持多个同时活跃的激光点
         
         # 正则表达式匹配激光点指令
         cursor_pattern = re.compile(
@@ -708,12 +708,12 @@ class PPTSyncedConverter:
             print(f"计算出现时间: {appear_time:.2f}s (段落开始: {segment_start:.2f}s)")
 
             if 'off' in cursor_cmd.lower():
-                # 关闭激光点
-                if active_laser is not None:
-                    active_laser['end'] = appear_time
-                    cursor_positions.append(active_laser)
-                    active_laser = None
-                    print(f"激光点关闭于时间: {appear_time:.2f}s") 
+                # 关闭所有活跃的激光点
+                for laser in active_lasers:
+                    laser['end'] = appear_time
+                    cursor_positions.append(laser)
+                    print(f"激光点关闭于时间: {appear_time:.2f}s，坐标({laser['x']},{laser['y']})")
+                active_lasers = []
             else:
                 # 解析坐标
                 coords = [int(g) for g in match.groups() if g]
@@ -721,22 +721,20 @@ class PPTSyncedConverter:
                     x = int(slide_width * coords[0] / 100)
                     y = int(slide_height * coords[1] / 100)
 
-                    if active_laser is not None:
-                        active_laser['end'] = appear_time
-                        cursor_positions.append(active_laser)
-                        print(f"切换激光点，关闭前一个于时间: {appear_time:.2f}s")
-                    
-                    # 添加新激光点
-                    active_laser = {
+                    # 创建新激光点，不结束之前的激光点
+                    new_laser = {
                         'x': x,
                         'y': y,
                         'start': appear_time,
                         'end': segment_start + actual_audio_duration  # 默认持续到段落结束
                     }
+                    active_lasers.append(new_laser)
                     print(f"新激光点创建于时间: {appear_time:.2f}s, 坐标({x},{y})")
-        if active_laser is not None:
-            cursor_positions.append(active_laser)
-            print(f"段落结束，激光点持续到: {segment_start + actual_audio_duration:.2f}s")
+        
+        # 段落结束，将所有剩余的激光点加入结果
+        for laser in active_lasers:
+            cursor_positions.append(laser)
+            print(f"段落结束，激光点持续到: {segment_start + actual_audio_duration:.2f}s，坐标({laser['x']},{laser['y']})")
         
         return cursor_positions
     
