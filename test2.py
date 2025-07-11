@@ -440,7 +440,7 @@ class PPTSyncedConverter:
                     def make_frame(t):
                         try:
                             return self._generate_frame_with_precise_laser(
-                                bg_img, t, segment_data, all_laser_points, width, height
+                                bg_img, t, segment_data, all_laser_points, width, height, lang, speed
                             )
                         except Exception as e:
                             print(f"Frame generation error at t={t:.2f}: {str(e)}")
@@ -489,7 +489,7 @@ class PPTSyncedConverter:
             traceback.print_exc()
             return self._create_fallback_clip(img_path, temp_dir, index)
 
-    def _generate_safe_subtitle(self, text, bg_img, max_width, max_height):
+    def _generate_progressive_subtitle(self, text, bg_img, max_width, max_height, current_time, segment_start, segment_duration, lang = 'zh-cn', speed = 1.0):
         try:
             # Handle case where bg_img is already an Image object
             if isinstance(bg_img, Image.Image):
@@ -501,8 +501,25 @@ class PPTSyncedConverter:
                 
             overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(overlay)
+
+            line_timings = self.calculate_line_timing(text, segment_duration, lang, speed)
+            if not line_timings:
+                return overlay
             
-            font_size = self.calculate_font_size(text, (max_width, max_height))            
+            relative_time = current_time - segment_start
+
+            visible_lines = []
+            for i, line_info in enumerate(line_timings):
+                if line_info['start'] <= relative_time < line_info['end']:
+                    visible_lines.append(line_info['text'])
+                    break
+            if not visible_lines:
+                if relative_time >= line_timings[-1]['end']:
+                    visible_lines.append(line_timings[-1]['text'])
+                else:
+                    return overlay
+            
+            font_size = self.calculate_font_size('\n'.join(visible_lines), (max_width, max_height))            
             try:
                 if self.is_english(text):
                     font = ImageFont.truetype("arial.ttf", font_size)
@@ -511,15 +528,12 @@ class PPTSyncedConverter:
             except:
                 font = ImageFont.load_default(size=font_size)
                 print("警告：使用默认字体，可能不支持中文")
-
-            wrapped_text = self.wrap_text(text, font, max_width)            
-            lines = wrapped_text.split('\n')
             
-            line_bboxes = [font.getbbox(line) for line in lines]
+            line_bboxes = [font.getbbox(line) for line in visible_lines]
             line_widths = [bbox[2] - bbox[0] for bbox in line_bboxes]
             line_heights = [bbox[3] - bbox[1] for bbox in line_bboxes]
             total_height = sum(line_heights)
-            max_line_width = max(line_widths)
+            max_line_width = max(line_widths) if line_widths else 0
             
             bg_width = max_line_width + 2 * self.subtitle_style['padding']
             bg_height = total_height + 2 * self.subtitle_style['padding']
@@ -534,7 +548,7 @@ class PPTSyncedConverter:
             )
             
             current_y = bg_y1 + self.subtitle_style['padding']
-            for i, line in enumerate(lines):
+            for i, line in enumerate(visible_lines):
                 text_width = font.getlength(line)
                 x = (img_size[0] - text_width) // 2
                 draw.text(
@@ -575,74 +589,154 @@ class PPTSyncedConverter:
             return ImageClip(blank).set_duration(3.0)
 
     def _split_text_segments(self, text):
-        """辅助方法：分割文本为语音段落"""
+        """改进的文本分割方法，按照自然段落和标点分割"""
         segments = []
-        current_segment = ""        
-        cursor_pattern = re.compile(r'(\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\])')
         
-        for line in text.split('\n'):
-            if line.strip():
-                parts = cursor_pattern.split(line)
+        # 首先按换行符分割
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 中文分割规则：按句号、分号、感叹号、问号分割
+            if any('\u4e00' <= c <= '\u9fff' for c in line):  # 检测中文字符
+                # 使用正则表达式按中文标点分割
+                parts = re.split(r'([。；！？])', line)
+                
+                # 重组分割后的文本
+                current_segment = ""
                 for part in parts:
-                    if not part:
-                        continue
-                        
-                    if cursor_pattern.match(part):
-                        current_segment += part
-                        if current_segment.strip():
-                            segments.append(current_segment)
+                    if part in ['。', '；', '！', '？']:
+                        if current_segment:
+                            segments.append(current_segment + part)
                             current_segment = ""
                     else:
                         current_segment += part
-                        if part.endswith(('。', '!', '?', ';')):                            
-                            segments.append(current_segment)
+                
+                if current_segment:
+                    segments.append(current_segment)
+            else:
+                # 英文分割规则：按句号、分号、感叹号、问号分割
+                parts = re.split(r'([.;!?])', line)
+                
+                # 重组分割后的文本
+                current_segment = ""
+                for part in parts:
+                    if part in ['.', ';', '!', '?']:
+                        if current_segment:
+                            segments.append(current_segment + part)
                             current_segment = ""
-
-        if current_segment:
-            segments.append(current_segment)
+                    else:
+                        current_segment += part
+                
+                if current_segment:
+                    segments.append(current_segment)
         
-        return segments
+        # 进一步处理过长的段落（超过30个字符）
+        final_segments = []
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                continue
+                
+            # 中文处理：按逗号分割过长的段落
+            if len(segment) > 30 and any('\u4e00' <= c <= '\u9fff' for c in segment):
+                comma_parts = segment.split('，')
+                for i, part in enumerate(comma_parts):
+                    if i < len(comma_parts)-1:
+                        final_segments.append(part + '，')
+                    else:
+                        final_segments.append(part)
+            # 英文处理：按逗号分割过长的段落
+            elif len(segment) > 30:
+                comma_parts = segment.split(',')
+                for i, part in enumerate(comma_parts):
+                    if i < len(comma_parts)-1:
+                        final_segments.append(part + ',')
+                    else:
+                        final_segments.append(part)
+            else:
+                final_segments.append(segment)
+        
+        return [s.strip() for s in final_segments if s.strip()]
 
-    def calculate_word_timing(self, text: str, lang: str = 'zh-cn', speed: float = 1.0) -> Dict:        
-        clean_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', text).strip()
-        if not clean_text:
-            return {}
-        speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
-        if lang and lang.startswith('zh'):
-            chars = list(clean_text)
-            chars_per_second = 3.5 * speed
-            word_timings = {}
-            current_time = 0.0
+    def calculate_line_timing(self, text, total_duration, lang = 'zh-cn', speed = 1.0):        
+        cursor_pattern = re.compile(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]')
+        clean_text = re.sub(cursor_pattern, '', text).strip()
+        if not clean_text.strip():
+            return []
+        
+        natural_line = clean_text.split('\n')
+        natural_line = [line.strip() for line in natural_line if line.strip()]
+        if not natural_line:
+            return []
 
-            for i, char in enumerate(chars):
-                if char.strip():
-                    char_duration = 1.0
-                    word_timings[i] = {
-                        'word': char,
-                        'start': current_time,
-                        'end': current_time + char_duration
-                    }
-                    current_time += char_duration
+        final_lines = []
+        for line in natural_line:
+            if len(line) > 30:
+                if lang and lang.startswith('zh'):
+                    parts = re.split(r'([，。！？；：])', line)
+                    current_part = ""
+                    for part in parts:
+                        if current_part and len(current_part + part) > 30:
+                            if current_part.strip():
+                                final_lines.append(current_part.strip())
+                            current_part = part
+                        else:
+                            current_part += part
+                    if current_part.strip():
+                        final_lines.append(current_part.strip())
                 else:
-                    current_time += 0.1
-        else:       
-            words = clean_text.split()
-            words_per_second = 2.5 * speed
+                    words = line.split()
+                    current_line = ""
+                    for word in words:
+                        if current_line and len(current_line + " " + word) > 30:
+                            if current_part.strip():
+                                final_lines.append(current_line.strip())
+                            current_line = word
+                        else:
+                            current_line = current_line + " " + word if current_line else word
+                    if current_line.strip():
+                        final_lines.append(current_line.strip())
+                
+            else:
+                final_lines.append(line)
 
-            word_timings = {}
-            current_time = 0.0
+        if not final_lines:
+            return []
+        
+        line_timings = []
+        current_time = 0.0
 
-            for i, word in enumerate(words):
-                word_duration = len(word) / (words_per_second * 3)
-                word_duration = max(0.2, min(1,0, word_duration))
+        if lang and lang.startswith('zh'):
+            total_chars = sum(len(line) for line in final_lines)
+            char_duration = total_duration / total_chars if total_chars > 0 else 0
 
-                word_timings[i] = {
-                    'word': word,
+            for line in final_lines:
+                line_char_count = len(line)
+                line_duration = line_char_count * char_duration
+                line_timings.append({
+                    'text': line,
                     'start': current_time,
-                    'end': current_time + word_duration
-                }
-                current_time += word_duration + 0.1
-        return word_timings
+                    'end': current_time + line_duration
+                })
+                current_time += line_duration
+        else:       
+            total_words = sum(len(line.split()) for line in final_lines)
+            word_duration = total_duration / total_words if total_words > 0 else 0
+
+            for line in final_lines:
+                words_in_line = len(line.split())
+                line_duration = words_in_line * word_duration
+                line_timings.append({
+                    'text': line,
+                    'start': current_time,
+                    'end': current_time + line_duration
+                })
+                current_time += line_duration
+        return line_timings
 
     def adjust_laser_timing(self, points, new_duration):
         if not points or new_duration <= 0:
@@ -668,7 +762,7 @@ class PPTSyncedConverter:
     def parse_laser_actions_precise(self, text, segment_start, actual_audio_duration, resolution, lang='zh-cn', speed=1.0):
         """精确的激光点时间解析 - 基于实际语音时长"""
         cursor_positions = []
-        active_laser = None
+        active_laser = []
         
         # 正则表达式匹配激光点指令
         cursor_pattern = re.compile(
@@ -709,33 +803,29 @@ class PPTSyncedConverter:
 
             if 'off' in cursor_cmd.lower():
                 # 关闭激光点
-                if active_laser is not None:
-                    active_laser['end'] = appear_time
-                    cursor_positions.append(active_laser)
-                    active_laser = None
+                for laser in active_laser:
+                    laser['end'] = appear_time
+                    cursor_positions.append(laser)
                     print(f"激光点关闭于时间: {appear_time:.2f}s") 
+                active_laser = []
             else:
                 # 解析坐标
                 coords = [int(g) for g in match.groups() if g]
                 if len(coords) >= 2:
                     x = int(slide_width * coords[0] / 100)
                     y = int(slide_height * coords[1] / 100)
-
-                    if active_laser is not None:
-                        active_laser['end'] = appear_time
-                        cursor_positions.append(active_laser)
-                        print(f"切换激光点，关闭前一个于时间: {appear_time:.2f}s")
                     
                     # 添加新激光点
-                    active_laser = {
+                    new_laser = {
                         'x': x,
                         'y': y,
                         'start': appear_time,
                         'end': segment_start + actual_audio_duration  # 默认持续到段落结束
                     }
+                    active_laser.append(new_laser)
                     print(f"新激光点创建于时间: {appear_time:.2f}s, 坐标({x},{y})")
-        if active_laser is not None:
-            cursor_positions.append(active_laser)
+        for laser in active_laser:
+            cursor_positions.append(laser)
             print(f"段落结束，激光点持续到: {segment_start + actual_audio_duration:.2f}s")
         
         return cursor_positions
@@ -792,10 +882,9 @@ class PPTSyncedConverter:
         
         return char_timings
     
-    def _generate_frame_with_precise_laser(self, bg_img, t, segment_data, all_laser_points, width, height):
+    def _generate_frame_with_precise_laser(self, bg_img, t, segment_data, all_laser_points, width, height, lang = 'zh-cn', speed = 1.0):
         """根据时间t生成包含精确激光点的帧"""
         try:
-            print(f"\n生成帧时间: {t:.2f}s")
             # 创建背景图像副本
             frame_img = bg_img.copy()
             overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -813,11 +902,16 @@ class PPTSyncedConverter:
             # 绘制字幕
             if current_segment and current_segment.get("clean_text"):
                 try:
-                    subtitle_img = self._generate_safe_subtitle(
+                    subtitle_img = self._generate_progressive_subtitle(
                         text=current_segment["clean_text"],
                         bg_img=frame_img,
                         max_width=width,
-                        max_height=height
+                        max_height=height,
+                        current_time = t,
+                        segment_start = current_segment.get("start_time", 0),
+                        segment_duration = current_segment.get("duration", 0),
+                        lang = lang, 
+                        speed = speed
                     )
                     
                     if subtitle_img and subtitle_img.size[0] > 0 and subtitle_img.size[1] > 0:
@@ -829,19 +923,14 @@ class PPTSyncedConverter:
                 except Exception as e:
                     print(f"帧{t:.2f}s字幕生成失败: {str(e)}")
             
-            print("所有激光点信息:")
-            for i, point in enumerate(all_laser_points):
-                print(f"激光点{i}: 坐标({point['x']},{point['y']}), 时间范围({point['start']:.2f}s-{point['end']:.2f}s)")
             # 绘制激光点（基于精确时间）            
             active_laser_points = self.get_active_laser_points(all_laser_points, t)
             if active_laser_points:
-                print(f"当前活跃激光点数量: {len(active_laser_points)}")
                 radius = int(height * Config.LASER_RADIUS_RATIO)                                
                 for point in active_laser_points:               
                     try:
                         x = max(radius, min(width - radius, int(point['x'])))
                         y = max(radius, min(height - radius, int(point['y'])))
-                        print(f"绘制激光点: 坐标({x},{y})")
                         
                         # 绘制光晕效果
                         glow_radius = radius + 15                        
@@ -954,7 +1043,6 @@ class PPTSyncedConverter:
             if 'start' in point and 'end' in point:
                 if point['start'] <= current_time < point['end']:
                     active_points.append(point)
-                    print(f"时间 {current_time:.2f}s: 活跃激光点 ({point['x']},{point['y']})")
         return active_points
     
     def _find_word_end_time(self, text_before: str, word_timings: Dict, lang: str) -> float:
@@ -976,6 +1064,24 @@ class PPTSyncedConverter:
                         if i in word_timings:
                             return word_timings[i]['end']
         return 0.0
+    def split_segments_with_laser_commands(text):
+        segments = []
+        current_segment = ""
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if line.startswith("[cursor:") and line.endswith("]"):
+                if current_segment:  # 保存前一个文本段
+                    segments.append({"type": "text", "content": current_segment})
+                    current_segment = ""
+                segments.append({"type": "laser", "command": line})  # 独立指令段
+            else:
+                current_segment += line + "\n"
+        
+        if current_segment:  # 处理最后剩余的文本段
+            segments.append({"type": "text", "content": current_segment})
+        
+        return segments
 
     def convert_ppt_to_video(self, pptx_path, output_path, lang='zh-cn', resolution=(854, 480), speed=1.0, fps=15):
         try:            
@@ -1180,3 +1286,4 @@ if __name__ == "__main__":
         speed=speed
     )
     print("转换成功!" if success else "转换失败")
+
