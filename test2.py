@@ -3,7 +3,7 @@ import re
 import tempfile
 from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
-from typing import List, Dict
+from typing import Dict
 import numpy as np
 from moviepy.editor import *
 from moviepy.video.fx.all import speedx
@@ -18,9 +18,9 @@ import psutil
 import gc
 import glob
 import subprocess
-import cv2
 import comtypes.client
 import traceback
+import argparse
 
 warnings.filterwarnings("ignore")
 
@@ -94,7 +94,7 @@ class PPTSyncedConverter:
         # 再清理临时文件
         self._cleanup_temp_files()
         
-# 强制终止可能残留的ffmpeg进程
+        # 强制终止可能残留的ffmpeg进程
         try:            
             for proc in psutil.process_iter(['pid', 'name']):
                 try:
@@ -138,7 +138,6 @@ class PPTSyncedConverter:
             
             notes_slide = slide.notes_slide
             text = notes_slide.notes_text_frame.text
-            print(f"✅ 提取到的备注内容: '{text}'")  # 调试输出
                 
             return text
         except Exception as e:
@@ -258,66 +257,56 @@ class PPTSyncedConverter:
     
     def process_audio_segment(self, text_segment, lang, speed, temp_dir, index):
         # Use MP3 extension consistently
-        try:
-            if not text_segment or not text_segment.strip():
-                duration = 1.0
-                return None, duration
-            
-            clean_text = text_segment.strip()
-            speed = max(0.5, min(3.0, float(speed))) if speed else 1.0
-
-            estimated_duration = max(1.0, len(clean_text) * 0.15)
-            estimated_duration = min(15.0, estimated_duration)
-
-            print(f"尝试生成音频：文本长度={len(clean_text)}，预估时长={estimated_duration:.1f}秒")
-            temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
-
-            # 1. Generate TTS audio
-            try:
-                tts = gTTS(text=clean_text, lang=lang, slow=False)
-                tts.save(temp_audio_path)
-
-                if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) < 1024:
-                    raise ValueError("TTS生成的文件无效或太小")
-                
-                try:
-                    audio = AudioFileClip(temp_audio_path)
-                    if audio.duration <= 0 or audio.duration > 30:
-                        audio.close()
-                        raise ValueError(f"音频时常异常: {audio.duration}")
-
-                    # 5. Speed adjustment
-                    if speed != 1.0:
-                        try:
-                            audio = audio.fx(speedx, speed)
-                        except Exception as e:
-                            print(f"语速调整失败，使用原速: {str(e)}")
-
-                    final_duration = audio.duration
-                    if final_duration <= 0 or final_duration > 30:
-                        audio.close()
-                        raise ValueError(f"最终音频时长异常：{final_duration}")
-                    print(f"音频生成成功：时长={final_duration:.1f}秒")
-                    return audio, final_duration
-
-                except Exception as e:
-                    print(f"音频加载失败: {str(e)}")
-                    return None, estimated_duration
-            except Exception as e:
-                print(f"TTS生成失败：{str(e)}")
-                return None, estimated_duration        
-        except Exception as e:
-            print(f"音频处理完全失败: {str(0)}")
-            fallback_duration = 2.0
-            return None, fallback_duration
+        temp_audio_path = os.path.join(temp_dir, f"audio_{index}.mp3")
+        final_audio_path = os.path.join(temp_dir, f"final_audio_{index}.mp3")
         
-        finally:
-            # Clean up temporary files            
-            temp_files = [
-                os.path.join(temp_dir, f"audio_{index}.mp3"),
-                os.path.join(temp_dir, f"final_audio_{index}.mp3")
+        try:
+            # 1. Generate TTS audio
+            tts = gTTS(text=text_segment, lang=lang, slow=False)
+            tts.save(temp_audio_path)
+            
+            # 2. Validate and convert the audio file
+            if not os.path.exists(temp_audio_path):
+                raise ValueError("TTS failed to generate audio file")
+                
+            # 3. Use FFmpeg to ensure proper format
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite without asking
+                '-i', temp_audio_path,
+                '-acodec', 'libmp3lame',  # Use standard MP3 codec
+                '-q:a', '2',  # Good quality
+                '-ar', '44100',  # Standard sample rate
+                '-ac', '2',  # Stereo
+                final_audio_path
             ]
-            for f in temp_files:
+            
+            # Run FFmpeg with error handling
+            result = subprocess.run(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            if result.returncode != 0:
+                raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
+                
+            # 4. Load audio with explicit format
+            audio = AudioFileClip(final_audio_path, fps=44100)
+            
+            # 5. Speed adjustment
+            if speed != 1.0:
+                audio = audio.fx(speedx, speed)
+                
+            return audio, audio.duration
+            
+        except Exception as e:
+            print(f"音频处理失败: {str(e)}")
+            return None, 0
+        finally:
+            # Clean up temporary files
+            for f in [temp_audio_path]:
                 if os.path.exists(f):
                     try:
                         os.unlink(f)
@@ -325,169 +314,303 @@ class PPTSyncedConverter:
                         pass
     
     def create_synced_slide(self, img_path, slide_index, lang, speed, temp_dir, index, resolution):
-        """创建带字幕和激光笔动画的幻灯片视频（完整安全版本）"""
+        """创建带字幕和激光笔动画的幻灯片视频（完整中英文支持版）"""
         try:
-            # ==================== 1. 初始化检查 ====================
-            gc.collect()
-            if psutil.virtual_memory().percent > 85:                
-                time.sleep(5)
-
-            # 验证输入参数
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"幻灯片图片不存在: {img_path}")
-            
+            if self.progress_callback:
+                self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|5", None)
+            # ==================== 1. 初始化 ====================
             width, height = resolution
-            if width <= 0 or height <= 0:
-                raise ValueError(f"无效的分辨率: {width}x{height}")
-            # ==================== 2. 加载幻灯片内容 ====================
+            bg_img = Image.open(img_path).convert('RGBA')
+            if bg_img.size != (width, height):
+                bg_img = bg_img.resize((width, height), Image.LANCZOS)
+            if self.progress_callback:
+                self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|10", None)
+
+            # ==================== 2. 处理备注文本 ====================
             slide = self.prs.slides[slide_index]
             notes_text = self._get_slide_notes(slide) or ""
+            if self.progress_callback:
+                self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|20", None)
 
-            # 提取纯净文本（移除激光指令）
-            display_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', notes_text).strip()
-            # ==================== 3. 文本预处理 ====================
-            # 自动翻译非目标语言文本
-            if display_text and lang != 'zh-cn' and any('\u4e00' <= c <= '\u9fff' for c in display_text):
-                display_text = translate_text(display_text, 'en')
-            
-            # 分割文本为适合语音合成的段落
-            segments = self._split_text_segments(notes_text)
-            if not segments:
-                segments = [display_text] if display_text else [""]
+            # ==================== 3. 文本翻译处理 ====================
+            def translate_if_needed(text):
+                """非目标语言的文本自动翻译"""
+                if not text:
+                    return text
+                    
+                # 中文模式下的英文内容翻译
+                if lang == 'zh-cn' and any(ord(c) > 127 for c in text):
+                    try:
+                        return translate_text(text, 'zh-cn')
+                    except:
+                        return text
+                # 英文模式下的中文内容翻译
+                elif lang == 'en' and any('\u4e00' <= c <= '\u9fff' for c in text):
+                    try:
+                        return translate_text(text, 'en')
+                    except:
+                        return text
+                return text
 
-            # ==================== 4. 生成语音和时长数据 ====================
-            video_clips = []
+            # ==================== 4. 智能分割文本 ====================
+            def split_segments(text):
+                """先按中文标点分段，再翻译为英文（保持语义完整）"""
+                def split_by_chinese_punctuation(text):
+                    """按中文标点分割文本"""
+                    segments = []
+                    buffer = ""
+                    
+                    # 特殊处理激光指令
+                    temp_text = re.sub(r'(\[cursor:[^\]]+\])', r'|||\1|||', text)
+                    
+                    for part in temp_text.split('|||'):
+                        if part.startswith('[cursor:') and part.endswith(']'):
+                            if buffer:
+                                segments.append(buffer)
+                                buffer = ""
+                            segments.append(part)
+                            continue
+                            
+                        # 中文标点：，。！？；\n
+                        parts = re.split(r'([，。！？；\n])', part)
+                        
+                        for p in parts:
+                            if not p:
+                                continue
+                                
+                            if p in ['，', '。', '！', '？', '；', '\n']:
+                                if buffer:
+                                    segments.append(buffer + p)
+                                    buffer = ""
+                            else:
+                                buffer += p
+                    
+                    if buffer:
+                        segments.append(buffer)
+                        
+                    return [s.strip() for s in segments if s.strip()]
+
+                # 1. 先按中文标点分段
+                chinese_segments = split_by_chinese_punctuation(text)
+                
+                # 2. 对每个分段进行翻译（如果是英文模式）
+                if not lang.startswith('zh'):
+                    translated_segments = []
+                    for seg in chinese_segments:
+                        if seg.startswith('[cursor:') and seg.endswith(']'):
+                            translated_segments.append(seg)
+                        else:
+                            translated_segments.append(translate_text(seg, 'en'))
+                    return translated_segments
+                
+                return chinese_segments
+
+            segments = split_segments(notes_text)
+            if self.progress_callback:
+                self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|30", None)
+            # ==================== 5. 生成语音和时间轴 ====================
             segment_data = []
             current_time = 0.0
 
             for i, segment in enumerate(segments):
-                try:
-                    clean_segment = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', segment).strip()
-
-                    audio = None
-                    duration = 2.0
-                    
-                    # 生成语音（带错误处理）
-                    if clean_segment:
-                        try:
-                            audio, duration = self.process_audio_segment(
-                                clean_segment, lang, speed, temp_dir, f"{index}_{i}"
-                            )
-                            print(f"段落{i}: 音频={'有效' if audio else '无'}，时长={duration:.1f}秒")
-                        except Exception as e:
-                            print(f"段落{i} 音频生成异常：{str(e)}")
-                            audio = None
-                            duration = max(1.0, len(clean_segment) * 0.15)
-                    else:
-                        duration = 3.0 if slide_index == 0 else 1.5  # 默认时长
-                    print(f"段落{i}: 空文本，使用默认时长{duration:.1f}秒")
-
-                    duration = max(0.5, min(15.0, duration))
-
+                progress = 30 + int((i+1)/len(segments)*50)
+                if self.progress_callback:
+                    self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|{progress}", None)
+                # 处理激光指令
+                if segment.startswith('[cursor:') and segment.endswith(']'):
                     segment_data.append({
-                        "text": segment,
-                        "clean_text": clean_segment,
-                        "audio": audio,                        
-                        "duration": duration,
-                        "start_time": current_time,
-                        "end_time": current_time + duration
+                        'type': 'laser',
+                        'text': segment,
+                        'start_time': current_time,
+                        'duration': 0.1,
+                        'end_time': current_time + 0.1
+                    })
+                    current_time += 0.1
+                    continue
+
+                # 生成语音
+                clean_text = re.sub(r'\[cursor:\s*\d+,\s*\d+\]|\[cursor:\s*off\]', '', segment).strip()
+                if not clean_text:
+                    duration = 1.5 if slide_index == 0 else 0.5
+                    segment_data.append({
+                        'type': 'empty',
+                        'text': segment,
+                        'clean_text': "",
+                        'start_time': current_time,
+                        'duration': duration,
+                        'end_time': current_time + duration
                     })
                     current_time += duration
+                    continue
 
-                except Exception as e:                    
-                    print(f"段落{i}处理失败: {str(e)}")
-                    fallback_duration = 2.0
-                    segment_data.append({
-                        "text": segment if 'segment' in locals() else "fallback",
-                        "clean_text": "",
-                        "audio": None,
-                        "duration": fallback_duration,
-                        "start_time": current_time,
-                        "end_time": current_time + fallback_duration
-                    })                    
-                    current_time += fallback_duration
-            # ==================== 5. 生成视频片段和精确激光点时间 ====================
-            all_laser_points = []            
-            print(f"原始备注文本: {notes_text}")
-            print(f"分割后的段落: {segments}")
-            for segment in segment_data:
-                # 使用新的精确时间解析方法
-                segment_laser_points = self.parse_laser_actions_precise(
-                    text=segment["text"],
-                    segment_start=segment["start_time"],
-                    actual_audio_duration=segment["duration"],        
-                    resolution = resolution,             
-                    lang=lang,                    
-                    speed=speed          
+                # 确保使用正确的语言生成语音
+                audio, duration = self.process_audio_segment(clean_text, lang, speed, temp_dir, f"{index}_{i}")
+                duration = max(0.5, min(15.0, duration if duration else 1.0))
+                
+                segment_data.append({
+                    'type': 'text',
+                    'text': segment,
+                    'clean_text': clean_text,
+                    'audio': audio,
+                    'start_time': current_time,
+                    'duration': duration,
+                    'end_time': current_time + duration
+                })
+                current_time += duration
+
+            # ==================== 6. 生成激光点数据 ====================
+            all_laser_points = []
+            active_lasers = []
+
+            for seg in segment_data:
+                if seg['type'] != 'laser':
+                    continue
+                    
+                text = seg['text']
+                if 'off' in text.lower():
+                    # 关闭激光点
+                    for laser in active_lasers:
+                        laser['end'] = seg['start_time']
+                        all_laser_points.append(laser)
+                    active_lasers = []
+                else:
+                    # 解析坐标（百分比转像素）
+                    coords = re.findall(r'\d+', text)
+                    if len(coords) >= 2:
+                        x = int(width * int(coords[0]) / 100)
+                        y = int(height * int(coords[1]) / 100)
+                        active_lasers.append({
+                            'x': max(10, min(width-10, x)),
+                            'y': max(10, min(height-10, y)),
+                            'start': seg['start_time'],
+                            'end': float('inf')
+                        })
+
+            # 处理未关闭的激光点
+            for laser in active_lasers:
+                laser['end'] = segment_data[-1]['end_time']
+                all_laser_points.append(laser)
+
+            # ==================== 7. 动态渲染 ====================
+            def make_frame(t):
+                frame = bg_img.copy()
+                overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(overlay)
+                
+                # 1. 获取当前应显示的分段
+                current_segment = next(
+                    (seg for seg in segment_data 
+                    if seg['start_time'] <= t < seg['end_time']),
+                    None
                 )
-                print(f"基于段落解析的激光点: {segment_laser_points}")
-                all_laser_points.extend(segment_laser_points)
-
-            try:
-                bg_img = Image.open(img_path).convert('RGBA')
-                if bg_img.size != (width, height):
-                    bg_img = bg_img.resize((width, height), Image.LANCZOS)
-            except Exception as e:
-                print(f"背景图片处理失败: {str(e)}")
-                bg_img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
-
-            # ==================== 6. Create final video clip ====================
-            total_duration = sum(seg.get("duration", 0) for seg in segment_data)
-            
-            if total_duration > 0:
-                try:
-                    # Create dynamic video clip
-                    def make_frame(t):
-                        try:
-                            return self._generate_frame_with_precise_laser(
-                                bg_img, t, segment_data, all_laser_points, width, height, lang, speed
-                            )
-                        except Exception as e:
-                            print(f"Frame generation error at t={t:.2f}: {str(e)}")
-                            return np.zeros((height, width, 3), dtype=np.uint8)
-
-                    video_clip = VideoClip(make_frame, duration=total_duration)
+                
+                # 2. 绘制字幕（仅当前分段）
+                if current_segment and current_segment.get('clean_text'):
+                    font_size = int(height * 0.035)
+                    try:
+                        font = ImageFont.truetype(
+                            "simhei.ttf" if lang.startswith('zh') else "arial.ttf",
+                            font_size
+                        )
+                    except:
+                        font = ImageFont.load_default(font_size)
                     
-                    # Add audio if available
-                    audio_clips = [seg["audio"] for seg in segment_data 
-                                if seg.get("audio") and hasattr(seg["audio"], 'duration')]
+                    # 计算文本位置（单行居中）
+                    text = current_segment['clean_text']
+                    text_width = font.getlength(text)
+                    text_height = font_size
+                    x = (width - text_width) // 2
+                    y = int(height * 0.85) - text_height
                     
-                    if audio_clips:
-                        try:
-                            combined_audio = concatenate_audioclips(audio_clips)
-                            video_clip = video_clip.set_audio(combined_audio)
-                        except Exception as e:
-                            print(f"Audio concatenation failed: {str(e)}")
-
-                    # Write to temporary file
-                    temp_video_path = os.path.join(temp_dir, f"slide_{index}_temp.mp4")
-                    video_clip.write_videofile(
-                        temp_video_path,
-                        fps=15,
-                        codec='libx264',
-                        audio_codec='aac',
-                        threads=4,
-                        verbose=False
+                    # 绘制背景
+                    draw.rectangle(
+                        [(x - 20, y - 10),
+                        (x + text_width + 20, y + text_height + 10)],
+                        fill=(0, 0, 128, 180)
                     )
                     
-                    if os.path.exists(temp_video_path) and os.path.getsize(temp_video_path) > 1024:
-                        return VideoFileClip(temp_video_path)
-                    
-                except Exception as e:
-                    print(f"Dynamic video generation failed: {str(e)}")
-                    traceback.print_exc()
-                    # Fallback to static method
-                    return self._create_static_video_segments(
-                        segment_data, bg_img, all_laser_points, 
-                        temp_dir, index, width, height
+                    # 绘制文本
+                    draw.text(
+                        (x, y),
+                        text,
+                        font=font,
+                        fill=(255, 255, 255),
+                        stroke_width=1,
+                        stroke_fill=(0, 0, 0)
                     )
+                
+                # 3. 绘制激光点
+                for point in all_laser_points:
+                    if point['start'] <= t < point['end']:
+                        radius = int(height * 0.015)
+                        # 光晕效果
+                        draw.ellipse(
+                            [(point['x']-radius*2, point['y']-radius*2),
+                            (point['x']+radius*2, point['y']+radius*2)],
+                            fill=(255, 100, 100, 100)
+                        )
+                        # 核心点
+                        draw.ellipse(
+                            [(point['x']-radius, point['y']-radius),
+                            (point['x']+radius, point['y']+radius)],
+                            fill=(255, 0, 0, 255)
+                        )
+                
+                return np.array(Image.alpha_composite(frame, overlay))[:, :, :3]
+
+            # ==================== 8. 合成最终视频 ====================
+            total_duration = segment_data[-1]['end_time']
+            video_clip = VideoClip(make_frame, duration=total_duration)
+
+            if self.progress_callback:
+                self.progress_callback(f"PAGE_PROGRESS|{slide_index+1}|{self.prs.slides.count}|90", None)
             
-            return self._create_fallback_clip(img_path, temp_dir, index)
+            # 添加音频
+            audio_clips = [seg['audio'] for seg in segment_data if seg.get('audio')]
+            if audio_clips:
+                combined_audio = concatenate_audioclips(audio_clips)
+                video_clip = video_clip.set_audio(combined_audio)
             
+            # 写入文件
+            temp_path = os.path.join(temp_dir, f"slide_{index}_final.mp4")
+            video_clip.write_videofile(
+                temp_path,
+                fps=15,
+                codec='libx264',
+                audio_codec='aac',
+                threads=4,
+                verbose=False
+            )
+            
+            return VideoFileClip(temp_path)
+
         except Exception as e:
-            print(f"Slide creation failed: {str(e)}")
+            print(f"幻灯片创建失败: {str(e)}")
             traceback.print_exc()
             return self._create_fallback_clip(img_path, temp_dir, index)
+
+    def _split_text_with_laser_commands(self, text):
+        """分割文本并保留激光指令位置"""
+        segments = []
+        current_segment = ""
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith('[cursor:') and line.endswith(']'):
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = ""
+                segments.append(line)
+            else:
+                current_segment += line + "\n"
+        
+        if current_segment:
+            segments.append(current_segment)
+        
+        return [s.strip() for s in segments if s.strip()]
 
     def _generate_progressive_subtitle(self, text, bg_img, max_width, max_height, current_time, segment_start, segment_duration, lang = 'zh-cn', speed = 1.0):
         try:
@@ -759,76 +882,51 @@ class PPTSyncedConverter:
                 continue
         return adjusted_points
         
-    def parse_laser_actions_precise(self, text, segment_start, actual_audio_duration, resolution, lang='zh-cn', speed=1.0):
-        """精确的激光点时间解析 - 基于实际语音时长"""
-        cursor_positions = []
-        active_laser = []
+    def parse_laser_actions_precise(self, segments_data):
+        """基于语音分段精确控制激光点时间"""
+        laser_points = []
+        active_lasers = []
         
-        # 正则表达式匹配激光点指令
-        cursor_pattern = re.compile(
-            r'\[cursor:\s*(\d+)\s*,\s*(\d+)\]|\[cursor:\s*off\]',
-            re.IGNORECASE
-        )
-
-        slide_width, slide_height = resolution
-        
-        # 移除激光点指令，获取纯文本用于时间计算
-        clean_text = re.sub(cursor_pattern, '', text)
-        
-        if not clean_text.strip():
-            return []
-
-        # 计算每个字符的时间位置（基于实际音频时长）
-        char_timings = self._calculate_char_timings(clean_text, actual_audio_duration, lang, speed)
-        
-        # 解析激光点指令
-        for match in cursor_pattern.finditer(text):
-            cursor_cmd = match.group()
+        for seg in segments_data:
+            text = seg["text"]
+            start_time = seg["start_time"]
+            end_time = seg["end_time"]
             
-            # 计算指令前的文本长度（不包括之前的指令）
-            text_before_cursor = text[:match.start()]
-            clean_text_before = re.sub(cursor_pattern, '', text_before_cursor)
-            char_count_before = len(clean_text_before.strip())
-            
-            # 计算激光点出现的精确时间
-            if char_count_before > 0:
-                # 基于前面文本的字符数量计算时间
-                appear_time = segment_start + char_timings.get(char_count_before - 1, actual_audio_duration)
-            else:
-                appear_time = segment_start
-            
-            print(f"激光点指令: {cursor_cmd}")            
-            print(f"指令前文本: '{clean_text_before}' (长度: {char_count_before})")
-            print(f"计算出现时间: {appear_time:.2f}s (段落开始: {segment_start:.2f}s)")
-
-            if 'off' in cursor_cmd.lower():
-                # 关闭激光点
-                for laser in active_laser:
-                    laser['end'] = appear_time
-                    cursor_positions.append(laser)
-                    print(f"激光点关闭于时间: {appear_time:.2f}s") 
-                active_laser = []
-            else:
-                # 解析坐标
-                coords = [int(g) for g in match.groups() if g]
-                if len(coords) >= 2:
-                    x = int(slide_width * coords[0] / 100)
-                    y = int(slide_height * coords[1] / 100)
-                    
-                    # 添加新激光点
-                    new_laser = {
-                        'x': x,
-                        'y': y,
-                        'start': appear_time,
-                        'end': segment_start + actual_audio_duration  # 默认持续到段落结束
-                    }
-                    active_laser.append(new_laser)
-                    print(f"新激光点创建于时间: {appear_time:.2f}s, 坐标({x},{y})")
-        for laser in active_laser:
-            cursor_positions.append(laser)
-            print(f"段落结束，激光点持续到: {segment_start + actual_audio_duration:.2f}s")
+            # 检测激光指令
+            if '[cursor:' in text and ']' in text:
+                if 'off' in text.lower():
+                    # 关闭激光点（使用当前段的开始时间）
+                    for laser in active_lasers:
+                        laser['end'] = start_time
+                        laser_points.append(laser)
+                    active_lasers = []
+                else:
+                    # 解析坐标（假设分辨率已在外部处理）
+                    coords = re.findall(r'\d+', text)
+                    if len(coords) >= 2:
+                        active_lasers.append({
+                            'x': int(coords[0]),
+                            'y': int(coords[1]),
+                            'start': start_time,  # 使用当前段的开始时间
+                            'end': float('inf')   # 默认持续到被关闭
+                        })
         
-        return cursor_positions
+        # 处理未关闭的激光点
+        for laser in active_lasers:
+            laser['end'] = segments_data[-1]["end_time"]  # 默认持续到最后
+            laser_points.append(laser)
+        
+        return laser_points
+
+    def _get_timing_position(self, char_pos, total_duration):
+        """计算字符位置对应的时间点"""
+        # 这里可以使用更精确的时间计算逻辑
+        return min(char_pos * 0.1, total_duration)  # 简单示例
+
+    def _get_timing_position(self, char_pos, total_duration):
+        """计算字符位置对应的时间点"""
+        # 这里可以使用更精确的时间计算逻辑
+        return min(char_pos * 0.1, total_duration)  # 简单示例
     
     def _calculate_char_timings(self, text, total_duration, lang='zh-cn', speed=1.0):       
         """计算每个字符的时间位置"""
@@ -1084,206 +1182,199 @@ class PPTSyncedConverter:
         return segments
 
     def convert_ppt_to_video(self, pptx_path, output_path, lang='zh-cn', resolution=(854, 480), speed=1.0, fps=15):
-        try:            
-            # ==================== 1. 初始化验证 ====================
-            self.update_progress("正在验证输入文件...")
+        try:
+            # ==================== 1. 初始化阶段 (0%-5%) ====================
+            self.update_progress("正在验证输入文件...", 0)
             pptx_path = self._ensure_path(pptx_path)
             output_path = self._ensure_path(output_path)
 
             if not os.path.exists(pptx_path):
-                raise FileNotFoundError(f"PPTX文件不存在: {pptx_path}")                
+                raise FileNotFoundError(f"PPTX文件不存在: {pptx_path}")
             if not pptx_path.lower().endswith('.pptx'):
                 raise ValueError("仅支持.pptx格式的文件")
 
-            # ==================== 2. 加载PPTX ====================
-            self.update_progress("正在加载PPTX文件...")
-            try:
-                self.prs = Presentation(pptx_path)
-                if len(self.prs.slides) == 0:
-                    raise ValueError("PPTX中没有幻灯片")
-            except Exception as e:
-                raise ValueError(f"PPTX加载失败: {str(e)}")
-                
-            # ==================== 3. 创建临时工作区 ====================
+            self.update_progress("正在加载PPTX文件...", 3)
+            self.prs = Presentation(pptx_path)
+            if len(self.prs.slides) == 0:
+                raise ValueError("PPTX中没有幻灯片")
+
+            # ==================== 2. 创建临时工作区 ====================
             temp_dir = tempfile.mkdtemp(prefix='ppt2video_')
-            try:
-                temp_dir = self._ensure_path(temp_dir)
-                self.update_progress(f"临时工作区: {temp_dir}")
-                
-                # ==================== 4. PPT转图片 ====================                
-                slide_images_dir = os.path.join(temp_dir, "slides")
-                os.makedirs(slide_images_dir, exist_ok=True)
-                
-                self.update_progress("正在将PPT转换为图片...")
-                if not self.ppt_to_images(pptx_path, slide_images_dir, resolution):
-                    raise RuntimeError("PPT转图片失败，请检查: 1) PowerPoint是否安装 2) 文件是否损坏 3) 是否有足够权限")
-                    
-                slide_images = sorted(glob.glob(os.path.join(slide_images_dir, "slide_*.png")))
-                if len(slide_images) != len(self.prs.slides):
-                    raise RuntimeError(f"生成的图片数量({len(slide_images)})与幻灯片数量({len(self.prs.slides)})不匹配")
+            self._lock_files.add(temp_dir)  # 注册临时目录以便清理
+            slide_images_dir = os.path.join(temp_dir, "slides")
+            os.makedirs(slide_images_dir, exist_ok=True)
 
-                # ==================== 5. 逐页处理 ====================
-                video_segments = []
-                success_count = 0
-                
-                for i, img_path in enumerate(slide_images):
-                    try:
-                        # 内存监控+                        
-                        mem = psutil.virtual_memory()
-                        if mem.available < 200 * 1024 * 1024:                            
-                            self.update_progress("内存不足，暂停处理...")                            
-                            time.sleep(5)                            
-                            gc.collect()
+            # ==================== 3. PPT转图片 (5%-20%) ====================
+            self.update_progress("正在将PPT转换为图片...", 5)
+            if not self.ppt_to_images(pptx_path, slide_images_dir, resolution):
+                raise RuntimeError("PPT转图片失败")
 
-                        # 处理单页
-                        self.update_progress(f"正在处理第{i+1}/{len(slide_images)}页...", (i+1)/len(slide_images))                        
-                        result = self.create_synced_slide(                            
-                            img_path=img_path,
-                            slide_index=i,                            
-                            lang=lang,
-                            speed=speed,                            
-                            temp_dir=temp_dir,
-                            index=i,                            
-                            resolution=resolution
-                        )
-                       
-                        if result:
-                            temp_video = os.path.join(temp_dir, f"clip_{i}.mp4")
-                            result.write_videofile(temp_video, fps=fps)
-                            if os.path.exists(temp_video) and os.path.getsize(temp_video) > 0:
-                                video_segments.append(temp_video)
-                                success_count += 1
-                            else:
-                                self.update_progress(f"生成的第{i+1}页视频无效")
-                        else:
-                            self.update_progress(f"跳过无效的第{i+1}页")
-                            
-                    except Exception as e:
-                        self.update_progress(f"第{i+1}页处理失败: {str(e)}")
-                        continue
+            slide_images = sorted(glob.glob(os.path.join(slide_images_dir, "slide_*.png")))
+            if len(slide_images) != len(self.prs.slides):
+                raise RuntimeError(f"生成的图片数量({len(slide_images)})与幻灯片数量({len(self.prs.slides)})不匹配")
 
-                # ==================== 6. 合并视频 ====================
-                if success_count > 0:
-                    self.update_progress("正在合并视频片段...")
-                    
-                    # 使用moviepy合并视频
-                    clips = []
-                    for seg in video_segments:
-                        try:
-                            clip = VideoFileClip(seg)
-                            clips.append(clip)
-                        except Exception as e:
-                            self.update_progress(f"加载视频片段失败: {seg} - {str(e)}")
-                    
-                    if clips:
-                        final_clip = concatenate_videoclips(clips)
-                        final_clip.write_videofile(
-                            output_path,
-                            fps=fps,
-                            threads=4,
-                            preset='ultrafast',
-                            audio_codec='aac',
-                            verbose=False
-                        )
-                        final_clip.close()
-                        
-                        for clip in clips:
-                            clip.close()
-                        
-                        return True
-                    
-                return False
-                
-            finally:
-                # 清理临时目录
+            # ==================== 4. 逐页处理 (20%-80%) ====================
+            video_segments = []
+            total_slides = len(slide_images)
+            success_count = 0
+
+            for i, img_path in enumerate(slide_images):
+                # 更新页面进度 (20% + 60% * 当前进度)
+                current_progress = 20 + (i / total_slides) * 60
+                # 假设 total_slides 是总页数，i 是当前页索引（从0开始）
+                current_page = i + 1
+                total_pages = total_slides
+                progress_percent = int(current_progress)  # 如果 current_progress 是 0~100 的数
+                self.update_progress(f"正在处理第 {current_page}/{total_pages} 页", current_progress)
+
+                # 🔧 关键：新增下面这行，输出 PROGRESS 格式给 PyQt 捕获
+                print(f"PROGRESS|{current_page}|{total_pages}|{progress_percent}")
+                sys.stdout.flush()  # 确保立即输出到管道，QProcess 才能收到
+
+                # 内存监控（每5页检查一次）
+                if i % 5 == 0:
+                    mem = psutil.virtual_memory()
+                    if mem.available < 200 * 1024 * 1024:
+                        self.update_progress("内存不足，正在清理...", current_progress)
+                        gc.collect()
+                        time.sleep(1)
+
                 try:
-                    for root, dirs, files in os.walk(temp_dir, topdown=False):
-                        for name in files:
-                            try:
-                                os.unlink(os.path.join(root, name))
-                            except:
-                                pass
-                        for name in dirs:
-                            try:
-                                os.rmdir(os.path.join(root, name))
-                            except:
-                                pass
-                    os.rmdir(temp_dir)
-                except:
-                    pass
+                    # 处理单页幻灯片（内部会调用PAGE_PROGRESS更新页内进度）
+                    video_clip = self.create_synced_slide(
+                        img_path=img_path,
+                        slide_index=i,
+                        lang=lang,
+                        speed=speed,
+                        temp_dir=temp_dir,
+                        index=i,
+                        resolution=resolution
+                    )
+
+                    # 保存临时视频片段
+                    temp_video = os.path.join(temp_dir, f"clip_{i}.mp4")
+                    video_clip.write_videofile(
+                        temp_video,
+                        fps=fps,
+                        threads=2,  # 限制线程数以节省内存
+                        verbose=False
+                    )
+                    
+                    if os.path.exists(temp_video) and os.path.getsize(temp_video) > 1024:
+                        video_segments.append(temp_video)
+                        success_count += 1
+                        self._lock_files.add(temp_video)  # 注册临时文件
+                    else:
+                        raise RuntimeError("生成的视频片段无效")
+
+                except Exception as e:
+                    self.update_progress(f"第 {i+1} 页处理失败: {str(e)}", current_progress)
+                    continue
+
+            # ==================== 5. 合并视频 (80%-95%) ====================
+            if success_count == 0:
+                raise RuntimeError("所有页面处理均失败")
+
+            self.update_progress("正在合并视频片段...", 80)
+            
+            # 分段加载视频片段以避免内存不足
+            final_clip = None
+            try:
+                for i, seg_path in enumerate(video_segments):
+                    # 更新合并进度 (80% + 15% * 当前进度)
+                    merge_progress = 80 + (i / len(video_segments)) * 15
+                    self.update_progress(f"正在合并第 {i+1}/{len(video_segments)} 段", merge_progress)
+
+                    clip = VideoFileClip(seg_path)
+                    if final_clip is None:
+                        final_clip = clip
+                    else:
+                        final_clip = concatenate_videoclips([final_clip, clip])
+
+                # ==================== 6. 最终编码 (95%-100%) ====================
+                self.update_progress("正在编码最终视频...", 95)
                 
+                # 编码进度回调函数
+                def encoding_callback(progress):
+                    """将moviepy的0-1进度映射到95%-100%"""
+                    self.update_progress(f"编码进度: {progress*100:.1f}%", 95 + progress*5)
+
+                print(f"[INFO] 正在导出最终视频到路径: {output_path}")
+                final_clip.write_videofile(
+                    output_path,
+                    fps=fps,
+                    threads=4,
+                    preset='fast',
+                    audio_codec='aac',
+                    verbose=False
+                )
+                # 确保文件系统有足够时间写入（特别是大文件）
+                time.sleep(1)
+
+                if os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+                    if file_size > 0:
+                        print(f"[SUCCESS] 视频已成功保存到: {output_path} (大小: {file_size} 字节)")
+                    else:
+                        print(f"[ERROR] 视频文件已创建但为空！路径: {output_path} (大小: 0 字节)")
+                else:
+                    print(f"[ERROR] 视频导出失败！文件未生成: {output_path}")
+
+                self.update_progress("视频导出完成!", 100)
+                return True
+
+            finally:
+                if final_clip:
+                    final_clip.close()
+                    
         except Exception as e:
-            self.update_progress(f"转换失败: {str(e)}")
+            self.update_progress(f"转换失败: {str(e)}", -1)
+            traceback.print_exc()
             return False
+            
         finally:
+            # 确保资源清理
             self._cleanup_resources()
-
-def get_users_choice():
-    print("请选择语音语言")
-    print("1. 中文")
-    print("2. 英文")
-    while True:
-        lang_choice = input("请输入选项(1-2): ").strip()
-        if lang_choice in ('1', '2'):
-            lang = 'zh-cn' if lang_choice == '1' else 'en'
-            break
-        print("无效输入，请重新选择")
-
-    print("\n请选择分辨率")
-    print("1. 1920x1080 (全高清)")
-    print("2. 1280x720 (高清)")
-    while True:
-        resolution_choice = input("请输入选项(1-2): ").strip()
-        if resolution_choice == '1':
-            resolution = (1920, 1080)
-            break       
-        elif resolution_choice == '2':
-            resolution = (1280, 720)
-            break
-        else:
-            print("无效输入，请重新选择")
-        
-    print("\n请选择语音速度")
-    print("1. 慢速 (0.75x)")
-    print("2. 正常 (1x)")
-    print("3. 快速 (1.5x)")
-    while True:
-        speed_choice = input("请输入选项(1-3): ").strip()
-        if speed_choice == '1':
-            speed = 0.75
-            break
-        elif speed_choice == '2':
-            speed = 1
-            break
-        elif speed_choice == '3':
-            speed = 1.5
-            break
-        else:
-            print("无效输入，请重新选择")
-
-    return lang, resolution, speed
+            gc.collect()
 
 if __name__ == "__main__":
 
     converter = PPTSyncedConverter()
     converter.subtitle_style['bg_color'] = (0, 0, 128, 180)  # 设置半透明深蓝色背景
 
-    lang, resolution, speed = get_users_choice()
+    # 1. 解析命令行参数
+    parser = argparse.ArgumentParser(description="PPT转视频工具")
+    parser.add_argument('--language', type=str, default='zh-cn', help='语音语言（zh-cn/en）')
+    parser.add_argument('--width', type=int, required=True, help='视频宽度（像素）')
+    parser.add_argument('--height', type=int, required=True, help='视频高度（像素）')
+    parser.add_argument('--speed', type=float, default=1.0, help='语音速度（0.5-2.0）')
+    parser.add_argument('--input', type=str, required=True, help='输入PPTX文件路径')
+    parser.add_argument('--output', type=str, default='output.mp4', help='输出视频路径')
+    # 可选：如果您已经有进度格式参数
+    parser.add_argument("--progress_format", type=str, default="percentage", help="进度格式")
 
-    def progress_callback(message, progress=None):
-        if progress is not None:
-            print(f"[{time.strftime('%H:%M:%S')}] {message} ({progress*100:.1f}%)")
-        else:
-            print(f"[{time.strftime('%H:%M:%S')}] {message}")
+    # 新增的参数
+    parser.add_argument("--single_slide", type=int, help="仅处理指定的幻灯片编号（从1开始）")
+    parser.add_argument("--slide_number", type=int, help="当前幻灯片编号（从1开始）")
+
+    # 解析参数
+    args = parser.parse_args()
+
+    # 2. 初始化转换器
+    converter = PPTSyncedConverter()
     
-    converter.set_progress_callback(progress_callback)
-    
+    # 3. 执行转换
+    # 在函数调用前打印（可选，也可不加）
+    print(f"[INFO] 接收到的视频输出路径为: {args.output}")
     success = converter.convert_ppt_to_video(
-        pptx_path="test.pptx",
-        output_path="output.mp4",
-        lang=lang,
-        resolution=resolution, 
-        speed=speed
+        pptx_path=args.input,
+        output_path=args.output,
+        lang=args.language,
+        resolution=(args.width, args.height),
+        speed=args.speed
     )
-    print("转换成功!" if success else "转换失败")
-
+    
+    if success:
+        print("转换成功！")
+    else:
+        print("转换失败")
